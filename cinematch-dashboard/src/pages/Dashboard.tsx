@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
 import { StatsCard } from '../components/StatsCard';
 import './Dashboard.css';
@@ -14,17 +14,30 @@ interface DashboardData {
 export function Dashboard() {
     const [data, setData] = useState<DashboardData | null>(null);
     const [loading, setLoading] = useState(true);
+    const [noData, setNoData] = useState(false);
+    const [uploading, setUploading] = useState(false);
+    const [uploadMessage, setUploadMessage] = useState<string | null>(null);
+    const fileInputRef = useRef<HTMLInputElement>(null);
 
-    useEffect(() => {
+    const fetchStats = () => {
         fetch('http://localhost:8000/user-stats', {
             headers: {
                 'Authorization': `Bearer ${localStorage.getItem('token')}`
             }
         })
-            .then(res => res.json())
+            .then(res => {
+                if (res.status === 404) {
+                    setNoData(true);
+                    setLoading(false);
+                    return null;
+                }
+                return res.json();
+            })
             .then(stats => {
-                if (!stats.error) {
+                if (stats && !stats.detail) {
                     setData(stats);
+                    setNoData(false);
+                    localStorage.setItem('has_data', 'true');
                 }
                 setLoading(false);
             })
@@ -32,11 +45,120 @@ export function Dashboard() {
                 console.error(err);
                 setLoading(false);
             });
+    };
+
+    useEffect(() => {
+        fetchStats();
     }, []);
+
+    const handleFileUpload = async (file: File) => {
+        if (!file.name.endsWith('.csv')) {
+            setUploadMessage('❌ Per favore carica un file CSV');
+            return;
+        }
+
+        setUploading(true);
+        setUploadMessage(null);
+
+        const formData = new FormData();
+        formData.append('file', file);
+
+        try {
+            const response = await fetch('http://localhost:8000/upload-csv', {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${localStorage.getItem('token')}`
+                },
+                body: formData
+            });
+
+            const result = await response.json();
+
+            if (response.ok) {
+                setUploadMessage(`✅ Caricati ${result.count} film con successo!`);
+                localStorage.setItem('has_data', 'true');
+                // Ricarica le statistiche
+                setTimeout(() => {
+                    fetchStats();
+                }, 1000);
+            } else {
+                setUploadMessage(`❌ ${result.detail || 'Errore durante il caricamento'}`);
+            }
+        } catch (err) {
+            setUploadMessage('❌ Errore di connessione al server');
+        } finally {
+            setUploading(false);
+        }
+    };
 
     if (loading) return <div className="loading-screen">Caricamento dati...</div>;
 
-    // Mostra dati di fallback se non ci sono dati reali (per la prima apertura)
+    // Se non ci sono dati, mostra il form di upload
+    if (noData) {
+        return (
+            <div className="dashboard-page">
+                <div className="page-header">
+                    <h1>Dashboard</h1>
+                    <p>Benvenuto! Carica i tuoi dati Letterboxd per iniziare</p>
+                </div>
+
+                <div className="upload-section">
+                    <div 
+                        className={`upload-zone ${uploading ? 'uploading' : ''}`}
+                        onClick={() => fileInputRef.current?.click()}
+                        onDragOver={(e) => { e.preventDefault(); }}
+                        onDrop={(e) => {
+                            e.preventDefault();
+                            const file = e.dataTransfer.files[0];
+                            if (file) handleFileUpload(file);
+                        }}
+                    >
+                        <input
+                            ref={fileInputRef}
+                            type="file"
+                            accept=".csv"
+                            style={{ display: 'none' }}
+                            onChange={(e) => {
+                                const file = e.target.files?.[0];
+                                if (file) handleFileUpload(file);
+                            }}
+                        />
+                        
+                        {uploading ? (
+                            <div className="upload-loading">
+                                <div className="spinner"></div>
+                                <p>Analizzando i tuoi film...</p>
+                            </div>
+                        ) : (
+                            <>
+                                <div className="upload-icon">📁</div>
+                                <h3>Carica il tuo export Letterboxd</h3>
+                                <p>Trascina qui il file ratings.csv o clicca per selezionarlo</p>
+                            </>
+                        )}
+                    </div>
+
+                    {uploadMessage && (
+                        <div className={`upload-message ${uploadMessage.startsWith('✅') ? 'success' : 'error'}`}>
+                            {uploadMessage}
+                        </div>
+                    )}
+
+                    <div className="upload-instructions">
+                        <h4>📋 Come esportare da Letterboxd:</h4>
+                        <ol>
+                            <li>Vai su <strong>letterboxd.com</strong> → Il tuo profilo</li>
+                            <li>Clicca su <strong>Settings</strong> → <strong>Import & Export</strong></li>
+                            <li>Scarica <strong>Export your data</strong></li>
+                            <li>Carica qui il file <code>ratings.csv</code></li>
+                        </ol>
+                    </div>
+                </div>
+            </div>
+        );
+    }
+
+    // Mostra la dashboard con i dati
     const displayData = data || {
         total_watched: 0,
         avg_rating: 0,

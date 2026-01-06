@@ -20,8 +20,11 @@ export function Login() {
             if (response.ok) {
                 const data = await response.json();
                 localStorage.setItem('token', data.access_token);
-                localStorage.setItem('username', username);
-                navigate('/');
+                localStorage.setItem('username', data.username || username);
+                localStorage.setItem('has_data', data.has_data ? 'true' : 'false');
+                
+                // Vai sempre alla dashboard - mostrerà upload se non ci sono dati
+                navigate('/dashboard');
             } else {
                 setError('Credenziali non valide');
             }

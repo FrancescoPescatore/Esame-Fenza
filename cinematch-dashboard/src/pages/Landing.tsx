@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import './Landing.css';
 
@@ -7,6 +7,14 @@ export function Landing() {
     const [fileName, setFileName] = useState<string | null>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const navigate = useNavigate();
+
+    // Se l'utente ha già dati, vai direttamente alla dashboard
+    useEffect(() => {
+        const hasData = localStorage.getItem('has_data');
+        if (hasData === 'true') {
+            navigate('/dashboard');
+        }
+    }, [navigate]);
 
     const handleDragOver = (e: React.DragEvent) => {
         e.preventDefault();
@@ -32,6 +40,7 @@ export function Landing() {
             });
 
             if (response.ok) {
+                localStorage.setItem('has_data', 'true'); // Aggiorna stato
                 setTimeout(() => navigate('/dashboard'), 1000);
             } else {
                 alert('Errore durante il caricamento');

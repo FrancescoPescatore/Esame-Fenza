@@ -1,7 +1,6 @@
 import { useEffect } from 'react';
 import { BrowserRouter as Router, Routes, Route, useLocation, Navigate } from 'react-router-dom';
 import { Sidebar } from './components/Sidebar';
-import { Landing } from './pages/Landing';
 import { Dashboard } from './pages/Dashboard';
 import { Recommendations } from './pages/Recommendations';
 import { Cinema } from './pages/Cinema';
@@ -46,7 +45,6 @@ function App() {
         <Routes>
           <Route path="/login" element={<Login />} />
           <Route path="/register" element={<Register />} />
-          <Route path="/" element={<ProtectedRoute><Landing /></ProtectedRoute>} />
           <Route
             path="/*"
             element={
@@ -55,6 +53,7 @@ function App() {
                   <Sidebar />
                   <main className="main-content">
                     <Routes>
+                      <Route path="/" element={<Navigate to="/dashboard" replace />} />
                       <Route path="/dashboard" element={<Dashboard />} />
                       <Route path="/recommendations" element={<Recommendations />} />
                       <Route path="/cinema" element={<Cinema />} />
