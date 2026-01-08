@@ -2,9 +2,14 @@
 CineMatch Backend API
 Sistema di raccomandazione film con analisi sentiment.
 """
-from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status
+from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status, BackgroundTasks
+from fastapi.concurrency import run_in_threadpool
+from apscheduler.schedulers.background import BackgroundScheduler
+from movie_updater import MovieUpdater
+import asyncio
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
+import requests
 import io
 import os
 import random
@@ -34,6 +39,7 @@ app.add_middleware(
 
 # ============================================
 # DATABASE CONNECTION
+TMDB_API_KEY = "272643841dd72057567786d8fa7f8c5f"
 # ============================================
 MONGO_URL = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
 client = MongoClient(MONGO_URL)
@@ -42,6 +48,7 @@ db = client.cinematch_db
 # Collections
 users_collection = db.users
 movies_collection = db.movies
+movies_catalog = db.movies_catalog
 stats_collection = db.user_stats
 sentiment_collection = db.sentiment_history
 activity_collection = db.activity_log
@@ -97,6 +104,22 @@ async def startup_event():
         print("✅ Utente di default creato: pasquale.langellotti")
     else:
         print("✅ Utente pasquale.langellotti già esistente")
+
+    # --- SCHEDULER UPDATE FILM ---
+    # Avvia scheduler per aggiornamento automatico film (Cinema/Digital 2026+)
+    updater = MovieUpdater(MONGO_URL, TMDB_API_KEY)
+    
+    scheduler = BackgroundScheduler()
+    # Esegue ogni 24 ore
+    scheduler.add_job(updater.fetch_new_releases, 'interval', hours=24)
+    scheduler.start()
+    print("🕒 Scheduler avviato: Aggiornamento catalogo automatico ogni 24h.")
+    
+    # Eseguiamo anche un update SUBITO all'avvio in background
+    # per riempire il buco del 2026 adesso
+    import threading
+    t = threading.Thread(target=updater.fetch_new_releases)
+    t.start()
     
     # Carica dati CSV se esistono e non sono già stati processati
     csv_path = "/data/ratings.csv"
@@ -215,6 +238,8 @@ def calculate_stats(df: pd.DataFrame, movies: list) -> dict:
         "top_directors": advanced_stats["top_directors"],
         "top_actors": advanced_stats["top_actors"],
         "rating_vs_imdb": advanced_stats["rating_vs_imdb"],
+        "total_unique_directors": advanced_stats.get("total_unique_directors", 0),
+        "total_unique_actors": advanced_stats.get("total_unique_actors", 0),
         "updated_at": datetime.utcnow().isoformat(),
         "top_years": calculate_top_years(movies)
     }
@@ -256,21 +281,31 @@ def calculate_advanced_stats(movies: list) -> dict:
     regex_pattern = f"^({'|'.join(escaped_titles)})$"
     
     catalog_movies = list(movies_catalog.find(
-        {"title": {"$regex": regex_pattern, "$options": "i"}},
-        {"title": 1, "genres": 1, "duration": 1, "director": 1, "actors": 1, "avg_vote": 1}
+        {
+            "$or": [
+                {"title": {"$regex": regex_pattern, "$options": "i"}},
+                {"original_title": {"$regex": regex_pattern, "$options": "i"}}
+            ]
+        },
+        {"title": 1, "original_title": 1, "genres": 1, "duration": 1, "director": 1, "actors": 1, "avg_vote": 1}
     ))
     
     # Crea mapping titolo -> dati catalogo
     title_data = {}
     for cm in catalog_movies:
-        title_key = cm['title'].lower()
-        title_data[title_key] = cm
+        # Map primary title
+        if cm.get('title'):
+            title_data[cm['title'].lower()] = cm
+        # Map original title too
+        if cm.get('original_title'):
+             title_data[cm['original_title'].lower()] = cm
     
     # Inizializza contatori
     genre_counter = Counter()
     director_counter = Counter()
     director_ratings = defaultdict(list)
     actor_counter = Counter()
+    actor_ratings = defaultdict(list)
     total_duration = 0
     duration_count = 0
     rating_vs_imdb = []
@@ -311,6 +346,7 @@ def calculate_advanced_stats(movies: list) -> dict:
                 actor = actor.strip()
                 if actor:
                     actor_counter[actor] += 1
+                    actor_ratings[actor].append(user_rating)
         
         # Rating vs IMDb
         imdb_rating = catalog_info.get('avg_vote')
@@ -337,8 +373,9 @@ def calculate_advanced_stats(movies: list) -> dict:
     favorite_genre = top_genres[0][0] if top_genres else "Nessuno"
     
     # Calcola statistiche registi
+    total_unique_directors = len(director_counter)
     top_directors = []
-    for director, count in director_counter.most_common(5):
+    for director, count in director_counter.most_common(10):  # Aumentiamo a 10 per sicurezza
         ratings = director_ratings[director]
         avg_rating = round(sum(ratings) / len(ratings), 1) if ratings else 0
         top_directors.append({
@@ -348,8 +385,46 @@ def calculate_advanced_stats(movies: list) -> dict:
         })
     
     # Calcola statistiche attori
-    top_actors = [{"name": actor, "count": count} for actor, count in actor_counter.most_common(8)]
+    total_unique_actors = len(actor_counter)
+    top_actors = []
+    for actor, count in actor_counter.most_common(15):
+        ratings = actor_ratings[actor]
+        avg_rating = round(sum(ratings) / len(ratings), 1) if ratings else 0
+        top_actors.append({
+            "name": actor,
+            "count": count,
+            "avg_rating": avg_rating
+        })
     
+    # Classifica per miglior rating (minimo 2 film se possibile, altrimenti 1)
+    best_rated_directors = []
+    # Prendiamo tutti i registi con almeno 1 film e calcoliamo avg
+    all_directors_stats = []
+    for d, count in director_counter.items():
+        ratings = director_ratings[d]
+        avg = sum(ratings) / len(ratings)
+        all_directors_stats.append({"name": d, "count": count, "avg_rating": round(avg, 2)})
+    
+    # Ordina per rating desc, poi count desc
+    best_rated_directors = sorted(
+        [d for d in all_directors_stats if d['count'] >= 1], 
+        key=lambda x: (x['avg_rating'], x['count']), 
+        reverse=True
+    )[:80] # Aumentato ulteriormente per permettere filtraggio esteso in frontend
+
+    best_rated_actors = []
+    all_actors_stats = []
+    for a, count in actor_counter.items():
+        ratings = actor_ratings[a]
+        avg = sum(ratings) / len(ratings)
+        all_actors_stats.append({"name": a, "count": count, "avg_rating": round(avg, 2)})
+    
+    best_rated_actors = sorted(
+        [a for a in all_actors_stats if a['count'] >= 1], 
+        key=lambda x: (x['avg_rating'], x['count']), 
+        reverse=True
+    )[:80] # Aumentato ulteriormente per permettere filtraggio esteso in frontend
+
     # Calcola durate
     avg_duration = round(total_duration / duration_count) if duration_count > 0 else 0
     total_hours = total_duration // 60
@@ -366,7 +441,11 @@ def calculate_advanced_stats(movies: list) -> dict:
         "avg_duration": avg_duration,
         "top_directors": top_directors,
         "top_actors": top_actors,
-        "rating_vs_imdb": rating_vs_imdb[:20]  # Top 20 più controversi
+        "best_rated_directors": best_rated_directors,
+        "best_rated_actors": best_rated_actors,
+        "rating_vs_imdb": rating_vs_imdb[:20],  # Top 20 più controversi
+        "total_unique_directors": total_unique_directors,
+        "total_unique_actors": total_unique_actors
     }
 
 
@@ -454,17 +533,91 @@ async def login(user: UserAuth):
 
 @app.get("/me")
 async def get_current_user(current_user_id: str = Depends(get_current_user_id)):
-    """Ottiene i dati dell'utente corrente."""
+    """Ottiene i dati dell'utente corrente (con conteggio film reale)."""
     user = users_collection.find_one({"user_id": current_user_id}, {"password": 0, "_id": 0})
     if not user:
         raise HTTPException(status_code=404, detail="Utente non trovato")
+    
+    # Calcola il conteggio reale dei film per assicurare sincronizzazione con la dashboard
+    real_count = movies_collection.count_documents({"user_id": current_user_id})
+    user["movies_count"] = real_count
+    
     return user
 
 # ============================================
 # DATA ENDPOINTS
 # ============================================
+def process_missing_movies_background(titles_years: list, user_id: str):
+    """
+    Task in background per cercare i film mancanti su TMDB 
+    e poi aggiornare le statistiche dell'utente.
+    """
+    print(f"🔄 [Background] Verifica catalogo per {len(titles_years)} titoli...")
+    
+    # 1. Cerca e aggiungi film mancanti
+    added_count = 0
+    # Import re qui se non è globale
+    import re
+    
+    for title, year in titles_years:
+        # Cerca nel catalogo locale (veloce)
+        exists = movies_catalog.find_one({
+            "$or": [
+                {"title": {"$regex": f"^{re.escape(title)}$", "$options": "i"}},
+                {"original_title": {"$regex": f"^{re.escape(title)}$", "$options": "i"}}
+            ]
+        })
+        
+        if not exists:
+            # Se non esiste, cerca su TMDB e aggiungi
+            result = fetch_metadata_from_tmdb(title, year)
+            if result:
+                added_count += 1
+                
+    print(f"✅ [Background] Aggiunti {added_count} nuovi film al catalogo.")
+    
+    # 2. Ricalcola le statistiche se sono stati aggiunti film
+    # O anche se non ne sono stati aggiunti, per sicurezza (se il primo calcolo era parziale)
+    if added_count > 0:
+        print("🔄 [Background] Ricalcolo statistiche utente...")
+        movies = list(movies_collection.find({"user_id": user_id}))
+        if movies:
+            # Ricostruisci il dataframe (approssimativo dai dati salvati)
+            # Nota: qui perdiamo alcune info originali del CSV se non salvate in movie, 
+            # ma movie object ha 'rating', 'year', 'name' che bastano per le stats di base.
+            # Per stats temporali servirebbe la 'date' originale se salvata.
+            
+            # Creiamo un DF minimale
+            data_for_df = []
+            for m in movies:
+                data_for_df.append({
+                    "Name": m["name"],
+                    "Year": m["year"],
+                    "Rating": m["rating"],
+                    "Date": m.get("date")
+                })
+            
+            df = pd.DataFrame(data_for_df)
+            
+            # Ricalcola
+            stats = calculate_stats(df, movies)
+            stats["user_id"] = user_id
+            stats["last_background_update"] = datetime.utcnow().isoformat()
+            
+            stats_collection.update_one(
+                {"user_id": user_id},
+                {"$set": stats},
+                upsert=True
+            )
+            print("✅ [Background] Statistiche aggiornate.")
+
+
 @app.post("/upload-csv")
-async def upload_csv(file: UploadFile = File(...), current_user_id: str = Depends(get_current_user_id)):
+async def upload_csv(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...), 
+    current_user_id: str = Depends(get_current_user_id)
+):
     """Carica e processa un file CSV di Letterboxd."""
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="Il file deve essere un CSV")
@@ -502,7 +655,65 @@ async def upload_csv(file: UploadFile = File(...), current_user_id: str = Depend
     movies_collection.delete_many({"user_id": current_user_id})
     movies_collection.insert_many(movies)
     
-    # Calcola e salva statistiche
+    # --- ARRICCHIMENTO CATALOGO DA CSV (SE PRESENTE) ---
+    # Se il CSV contiene già metadati (come poster_url, director, ecc.), li salviamo nel catalogo
+    catalog_updates = 0
+    possible_cols = [
+        'imdb_title_id', 'original_title', 'genre', 'duration', 'country', 
+        'language', 'director', 'writer', 'production_company', 'actors', 
+        'description', 'avg_vote', 'votes', 'budget', 'usa_gross_income', 
+        'worlwide_gross_income', 'metascore', 'reviews_from_users', 
+        'reviews_from_critics', 'link_imdb', 'poster_url'
+    ]
+    
+    # Se ci sono colonne di metadati, aggiorna il catalogo
+    if any(col in df.columns for col in possible_cols):
+        for _, row in df.iterrows():
+            if pd.isna(row.get('imdb_title_id')) and pd.isna(row.get('poster_url')):
+                continue
+                
+            entry = {
+                "title": row['Name'],
+                "year": int(row['Year']) if pd.notna(row.get('Year')) else None,
+                "loaded_at": datetime.utcnow().isoformat(),
+                "source": "csv_upload_enriched"
+            }
+            
+            # Mappa tutte le colonne presenti
+            for col in possible_cols:
+                if col in df.columns and pd.notna(row[col]):
+                    val = row[col]
+                    # Gestione speciale generi
+                    if col == 'genre':
+                        entry['genre'] = val
+                        entry['genres'] = [g.strip() for g in str(val).split(',')]
+                    elif col == 'imdb_title_id':
+                        entry['imdb_id'] = val
+                        entry['imdb_title_id'] = val
+                    else:
+                        entry[col] = val
+            
+            # Salva o aggiorna nel catalogo
+            if entry.get('imdb_id'):
+                movies_catalog.update_one(
+                    {"imdb_id": entry['imdb_id']},
+                    {"$set": entry},
+                    upsert=True
+                )
+                catalog_updates += 1
+            else:
+                # Se non ha IMDB ID, usa titolo e anno come chiave
+                movies_catalog.update_one(
+                    {"title": entry['title'], "year": entry['year']},
+                    {"$set": entry},
+                    upsert=True
+                )
+                catalog_updates += 1
+    
+    if catalog_updates > 0:
+        print(f"📊 Aggiornati {catalog_updates} film nel catalogo dai metadati del CSV.")
+
+    # Calcola e salva statistiche iniziali (con quello che c'è)
     stats = calculate_stats(df, movies)
     stats["user_id"] = current_user_id
     stats["source_file"] = file.filename
@@ -522,12 +733,16 @@ async def upload_csv(file: UploadFile = File(...), current_user_id: str = Depend
         }}
     )
     
+    # Avvia task in background per i film mancanti
+    titles_years = list(set([(m["name"], m["year"]) for m in movies]))
+    background_tasks.add_task(process_missing_movies_background, titles_years, current_user_id)
+    
     return {
         "status": "success",
         "filename": file.filename,
         "count": len(movies),
         "stats": stats,
-        "message": f"Caricati {len(movies)} film con successo!"
+        "message": f"Caricati {len(movies)} film. Ricerca copertine avviata in background."
     }
 
 
@@ -559,15 +774,21 @@ async def recalculate_stats(current_user_id: str = Depends(get_current_user_id))
 
 @app.get("/user-stats")
 async def get_user_stats(current_user_id: str = Depends(get_current_user_id)):
-    """Ottiene le statistiche dell'utente."""
+    """Ottiene le statistiche dell'utente (sempre sincronizzate col DB)."""
     stats = stats_collection.find_one({"user_id": current_user_id}, {"_id": 0})
     
     if not stats:
         raise HTTPException(status_code=404, detail="Nessun dato trovato. Carica prima un file CSV.")
     
-    # Se mancano le nuove statistiche, ricalcola tutto
+    # Calcola il conteggio REALE dei film ogni volta per evitare discrepanze con la navbar/catalogo
+    real_count = movies_collection.count_documents({"user_id": current_user_id})
+    stats["total_watched"] = real_count
+    
+    # Se mancano le nuove statistiche o sono incomplete (es. meno di 40 per i best_rated), ricalcola tutto
     needs_recalc = False
-    if "top_directors" not in stats or "top_actors" not in stats or "rating_vs_imdb" not in stats:
+    if "best_rated_directors" not in stats or "best_rated_actors" not in stats:
+        needs_recalc = True
+    elif len(stats.get("best_rated_directors", [])) < 30: # Forza ricalcolo se abbiamo ancora le vecchie stats "corte"
         needs_recalc = True
     elif "genre_data" in stats and stats["genre_data"] and "count" not in stats["genre_data"][0]:
         needs_recalc = True
@@ -585,7 +806,11 @@ async def get_user_stats(current_user_id: str = Depends(get_current_user_id)):
             "avg_duration": advanced_stats["avg_duration"],
             "top_directors": advanced_stats["top_directors"],
             "top_actors": advanced_stats["top_actors"],
-            "rating_vs_imdb": advanced_stats["rating_vs_imdb"]
+            "best_rated_directors": advanced_stats.get("best_rated_directors", []),
+            "best_rated_actors": advanced_stats.get("best_rated_actors", []),
+            "rating_vs_imdb": advanced_stats["rating_vs_imdb"],
+            "total_unique_directors": advanced_stats.get("total_unique_directors", 0),
+            "total_unique_actors": advanced_stats.get("total_unique_actors", 0)
         })
         
         # Salva nel database
@@ -608,6 +833,49 @@ async def get_movies(current_user_id: str = Depends(get_current_user_id)):
         {"_id": 0, "user_id": 0}
     ))
     return movies
+
+@app.get("/movies/person")
+async def get_movies_by_person(name: str, type: str, current_user_id: str = Depends(get_current_user_id)):
+    """Ottiene i film dell'utente filtrati per regista o attore."""
+    user_movies = list(movies_collection.find({"user_id": current_user_id}))
+    titles = [m.get('name') for m in user_movies]
+    
+    import re
+    field = "director" if type == "director" else "actors"
+    
+    # Cerchiamo nel catalogo tutti i film di quella persona
+    catalog_matches = list(movies_catalog.find({
+        field: {"$regex": re.escape(name), "$options": "i"}
+    }, {"title": 1, "original_title": 1, "genres": 1, "poster_url": 1, "poster_path": 1, "year": 1, "avg_vote": 1, "director": 1, "actors": 1}))
+    
+    catalog_map = {}
+    for cm in catalog_matches:
+        if cm.get('title'): catalog_map[cm['title'].lower()] = cm
+        if cm.get('original_title'): catalog_map[cm['original_title'].lower()] = cm
+        
+    results = []
+    for m in user_movies:
+        title = m.get('name', '').lower()
+        if title in catalog_map:
+            cat_info = catalog_map[title]
+            
+            # Priorità al poster_url (stessa logica del catalogo), poi poster_path TMDB
+            poster = cat_info.get('poster_url')
+            if not poster and cat_info.get('poster_path'):
+                poster = f"https://image.tmdb.org/t/p/w500{cat_info['poster_path']}"
+            
+            results.append({
+                "id": str(m.get('_id', random.randint(1, 100000))),
+                "title": m.get('name'),
+                "year": m.get('year') or cat_info.get('year'),
+                "poster": poster or STOCK_POSTER_URL,
+                "rating": m.get('rating', 0),
+                "genres": cat_info.get('genres', []),
+                "director": cat_info.get('director', ''),
+                "actors": cat_info.get('actors', '')
+            })
+            
+    return results
 
 @app.get("/monthly-stats/{year}")
 async def get_monthly_stats(year: int, current_user_id: str = Depends(get_current_user_id)):
@@ -655,15 +923,148 @@ async def get_monthly_stats(year: int, current_user_id: str = Depends(get_curren
         "available_years": sorted(list(available_years), reverse=True)
     }
 
+
+
+def fetch_metadata_from_tmdb(title: str, year: Optional[int]) -> Optional[dict]:
+    """
+    Cerca metadati su TMDB se mancano nel catalogo locale.
+    Esegue una chiamata 'details' per ottenere dati arricchiti (cast, crew, budget, etc).
+    Salva il risultato nel catalogo per usi futuri.
+    """
+    if not title:
+        return None
+        
+    print(f"🌍 Searching TMDB for: {title} ({year})")
+    url = "https://api.themoviedb.org/3/search/movie"
+    params = {
+        "api_key": TMDB_API_KEY,
+        "query": title,
+        "language": "it-IT"
+    }
+    if year:
+        params["year"] = year
+        
+    try:
+        response = requests.get(url, params=params, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            results = data.get("results", [])
+            
+            # Se la ricerca con anno fallisce, riprova senza
+            if not results and year:
+                 del params["year"]
+                 response = requests.get(url, params=params, timeout=5)
+                 if response.status_code == 200:
+                     results = response.json().get("results", [])
+            
+            # Se non trova in IT, prova EN
+            if not results:
+                params.pop("year", None)
+                params["language"] = "en-US"
+                response = requests.get(url, params=params, timeout=5)
+                if response.status_code == 200:
+                    results = response.json().get("results", [])
+
+            if results:
+                tmdb_movie = results[0]  # Prendi il primo risultato
+                movie_id = tmdb_movie['id']
+                
+                # CHIAMATA DETAILS PER DATI COMPLETI
+                details_url = f"https://api.themoviedb.org/3/movie/{movie_id}"
+                d_params = {
+                     "api_key": TMDB_API_KEY, 
+                     "language": "it-IT", 
+                     "append_to_response": "credits"
+                }
+                d_response = requests.get(details_url, params=d_params, timeout=5)
+                details = d_response.json() if d_response.status_code == 200 else {}
+
+                # Fallback ai risultati di ricerca se details fallisce
+                if not details: 
+                    details = tmdb_movie
+
+                credits = details.get("credits", {})
+                crew = credits.get("crew", [])
+                cast = credits.get("cast", [])
+                
+                # Estrazione dati arricchiti
+                directors = [p['name'] for p in crew if p['job'] == 'Director']
+                writers = [p['name'] for p in crew if p['department'] == 'Writing']
+                actors_list = [p['name'] for p in cast[:15]]
+                production_companies = [c['name'] for c in details.get("production_companies", [])]
+                genres_list = [g['name'] for g in details.get("genres", [])]
+                
+                # Conversione valute (USD default)
+                budget = details.get("budget")
+                revenue = details.get("revenue")
+                budget_str = f"$ {budget}" if budget else None
+                revenue_str = f"$ {revenue}" if revenue else None
+                
+                poster_path = details.get("poster_path") or tmdb_movie.get("poster_path")
+                poster_url = f"https://image.tmdb.org/t/p/w500{poster_path}" if poster_path else STOCK_POSTER_URL
+                
+                # Mappatura completa come movie_final.csv
+                new_catalog_entry = {
+                    "imdb_id": details.get("imdb_id") if details.get("imdb_id") else f"tmdb_{movie_id}",
+                    "imdb_title_id": details.get("imdb_id") if details.get("imdb_id") else f"tmdb_{movie_id}",
+                    "title": details.get("title", title),
+                    "original_title": details.get("original_title"),
+                    "english_title": details.get("original_title") if details.get("original_language") == "en" else None,
+                    "year": int(details.get("release_date", "0")[:4]) if details.get("release_date") else year,
+                    "date_published": details.get("release_date"),
+                    "genres": genres_list, # Lista, viene gestita bene da MongoDB
+                    "genre": ", ".join(genres_list), # Stringa per compatibilità CSV
+                    "duration": details.get("runtime"),
+                    "country": details.get("origin_country", [None])[0] if details.get("origin_country") else None,
+                    "language": details.get("original_language"),
+                    "movie_language": details.get("original_language"),
+                    "director": ", ".join(directors),
+                    "writer": ", ".join(writers),
+                    "production_company": ", ".join(production_companies),
+                    "actors": ", ".join(actors_list),
+                    "description": details.get("overview"),
+                    "avg_vote": details.get("vote_average"),
+                    "votes": details.get("vote_count"),
+                    "budget": budget_str,
+                    "usa_gross_income": None, # Difficile da mappare da TMDB generico
+                    "worlwide_gross_income": revenue_str,
+                    "metascore": None,
+                    "reviews_from_users": None,
+                    "reviews_from_critics": None,
+                    "link_imdb": f"https://www.imdb.com/title/{details.get('imdb_id')}/" if details.get("imdb_id") else None,
+                    "poster_url": poster_url,
+                    "has_real_poster": bool(poster_path),
+                    "loaded_at": datetime.utcnow().isoformat(),
+                    "source": "tmdb_enriched_fetch"
+                }
+                
+                # Salva nel DB per cache futura
+                # Usa update_one con upsert basato sul titolo per evitare duplicati
+                movies_catalog.update_one(
+                    {"imdb_id": new_catalog_entry["imdb_id"]},
+                    {"$set": new_catalog_entry},
+                    upsert=True
+                )
+                
+                return new_catalog_entry
+                
+    except Exception as e:
+        print(f"⚠️ TMDB Error: {e}")
+        
+    return None
+
+
+
+
 @app.get("/user-movies")
 async def get_user_movies(
     current_user_id: str = Depends(get_current_user_id),
     skip: int = 0,
-    limit: int = 500
+    limit: int = 10000
 ):
     """
     Ottiene la lista dei film dell'utente con poster dal catalogo.
-    Ottimizzato: recupera prima i film utente, poi fa un batch lookup nel catalogo.
+    Aumentato limite a 10000 per evitare discrepanze tra dashboard e catalogo.
     """
     # Step 1: Recupera i film dell'utente
     user_movies = list(movies_collection.find(
@@ -688,24 +1089,45 @@ async def get_user_movies(
         # Query batch per tutti i titoli - usa $in per ricerca esatta (più veloce)
         title_list = list(set(t["title"] for t in titles_to_lookup))
         
-        # Escape caratteri speciali regex e costruisci pattern
+        # Fai chunking se la lista è troppo lunga per evitare regex giganti
+        # MongoDB regex ha limiti, meglio fare più query se necessario
+        # Ma per ora assumiamo che limit=500 sia gestibile
         import re
         escaped_titles = [re.escape(t) for t in title_list]
         regex_pattern = f"^({'|'.join(escaped_titles)})$"
         
         catalog_movies = movies_catalog.find(
-            {"title": {"$regex": regex_pattern, "$options": "i"}},
-            {"title": 1, "year": 1, "poster_url": 1, "imdb_id": 1, "genres": 1}
+            {
+                "$or": [
+                    {"title": {"$regex": regex_pattern, "$options": "i"}},
+                    {"original_title": {"$regex": regex_pattern, "$options": "i"}},
+                    {"english_title": {"$regex": regex_pattern, "$options": "i"}} # Supporto per titoli inglesi
+                ]
+            },
+            {"title": 1, "original_title": 1, "english_title": 1, "year": 1, "poster_url": 1, "imdb_id": 1, "genres": 1, "description": 1, "director": 1, "actors": 1}
         )
         
         # Costruisci cache con chiave title_year
         for cm in catalog_movies:
-            key = f"{cm['title'].lower()}_{cm.get('year', '')}"
-            catalog_cache[key] = cm
-            # Anche solo per titolo come fallback
-            title_key = cm['title'].lower()
-            if title_key not in catalog_cache:
-                catalog_cache[title_key] = cm
+            # Helper per aggiungere alla cache
+            def add_to_cache(t, y, movie):
+                if not t: return
+                t_lower = t.lower()
+                # Key con anno
+                key_year = f"{t_lower}_{y}"
+                catalog_cache[key_year] = movie
+                # Key solo titolo (fallback)
+                if t_lower not in catalog_cache:
+                    catalog_cache[t_lower] = movie
+
+            # Mappa titolo principale
+            add_to_cache(cm.get('title'), cm.get('year', ''), cm)
+            
+            # Mappa titolo originale
+            add_to_cache(cm.get('original_title'), cm.get('year', ''), cm)
+
+            # Mappa titolo inglese
+            add_to_cache(cm.get('english_title'), cm.get('year', ''), cm)
         
         # Step 4: Applica i dati del catalogo ai film utente
         for movie in user_movies:
@@ -720,8 +1142,30 @@ async def get_user_movies(
                     movie["poster_url"] = catalog_movie.get("poster_url") or STOCK_POSTER_URL
                     movie["imdb_id"] = catalog_movie.get("imdb_id")
                     movie["genres"] = catalog_movie.get("genres", [])
+                    # Dettagli extra per popup
+                    movie["description"] = catalog_movie.get("description")
+                    movie["director"] = catalog_movie.get("director")
+                    movie["actors"] = catalog_movie.get("actors")
+                    movie["duration"] = catalog_movie.get("duration")
+                    movie["avg_vote"] = catalog_movie.get("avg_vote")
                 else:
-                    movie["poster_url"] = STOCK_POSTER_URL
+                    # PROVA ARRICCHIMENTO ON-THE-FLY (Max 3 per richiesta per non rallentare)
+                    # Solo se il film non è mai stato cercato prima o non ha nessuna info
+                    try:
+                        fetched_info = fetch_metadata_from_tmdb(movie["name"], movie.get("year"))
+                        if fetched_info:
+                            movie["poster_url"] = fetched_info.get("poster_url")
+                            movie["imdb_id"] = fetched_info.get("imdb_id")
+                            movie["genres"] = fetched_info.get("genres", [])
+                            movie["description"] = fetched_info.get("description")
+                            movie["director"] = fetched_info.get("director")
+                            movie["actors"] = fetched_info.get("actors")
+                            movie["duration"] = fetched_info.get("duration")
+                            movie["avg_vote"] = fetched_info.get("avg_vote")
+                        else:
+                            movie["poster_url"] = STOCK_POSTER_URL
+                    except:
+                        movie["poster_url"] = STOCK_POSTER_URL
     
     total = movies_collection.count_documents({"user_id": current_user_id})
     
@@ -733,11 +1177,13 @@ async def get_user_movies(
     }
 
 
+
 # Modello per aggiungere film
 class AddMovieRequest(BaseModel):
     name: str
     year: int
     rating: int
+    comment: Optional[str] = None
     imdb_id: Optional[str] = None
     poster_url: Optional[str] = None
 
@@ -747,10 +1193,11 @@ class RemoveMovieRequest(BaseModel):
     year: int
 
 
-class UpdateRatingRequest(BaseModel):
+class UpdateMovieRequest(BaseModel):
     name: str
     year: int
-    rating: int
+    rating: Optional[int] = None
+    comment: Optional[str] = None
 
 
 @app.post("/user-movies/add")
@@ -767,7 +1214,16 @@ async def add_movie_to_collection(
     })
     
     if existing:
-        raise HTTPException(status_code=400, detail="Film già presente nella collezione")
+        # Se esiste, aggiorna commento e rating
+        movies_collection.update_one(
+            {"_id": existing["_id"]},
+            {"$set": {
+                "rating": movie.rating,
+                "comment": movie.comment,
+                "updated_at": datetime.utcnow().isoformat()
+            }}
+        )
+        return {"status": "success", "message": "Film aggiornato"}
     
     # Crea documento film
     new_movie = {
@@ -775,6 +1231,7 @@ async def add_movie_to_collection(
         "name": movie.name,
         "year": movie.year,
         "rating": movie.rating,
+        "comment": movie.comment,
         "date": datetime.utcnow().strftime("%Y-%m-%d"),
         "imdb_id": movie.imdb_id,
         "poster_url": movie.poster_url,
@@ -782,23 +1239,32 @@ async def add_movie_to_collection(
     }
     
     movies_collection.insert_one(new_movie)
-    
-    # Aggiorna conteggio utente
-    users_collection.update_one(
-        {"user_id": current_user_id},
-        {
-            "$inc": {"movies_count": 1},
-            "$set": {"has_data": True}
-        }
+    return {"status": "success", "message": "Film aggiunto"}
+
+
+@app.post("/user-movies/update")
+async def update_user_movie(
+    req: UpdateMovieRequest,
+    current_user_id: str = Depends(get_current_user_id)
+):
+    """Aggiorna voto o commento di un film nei 'visti'."""
+    update_data = {}
+    if req.rating is not None: update_data["rating"] = req.rating
+    if req.comment is not None: update_data["comment"] = req.comment
+    update_data["updated_at"] = datetime.utcnow().isoformat()
+
+    res = movies_collection.update_one(
+        {"user_id": current_user_id, "name": req.name, "year": req.year},
+        {"$set": update_data}
     )
     
-    # Ricalcola statistiche
-    await recalculate_user_stats(current_user_id)
-    
-    return {"message": "Film aggiunto con successo", "movie": movie.name}
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Film non trovato nei tuoi visti")
+        
+    return {"status": "success"}
 
 
-@app.delete("/user-movies/remove")
+@app.post("/user-movies/remove")
 async def remove_movie_from_collection(
     movie: RemoveMovieRequest,
     current_user_id: str = Depends(get_current_user_id)
@@ -827,7 +1293,7 @@ async def remove_movie_from_collection(
 
 @app.put("/user-movies/update-rating")
 async def update_movie_rating(
-    movie: UpdateRatingRequest,
+    movie: UpdateMovieRequest,
     current_user_id: str = Depends(get_current_user_id)
 ):
     """Aggiorna il rating di un film nella collezione."""
@@ -859,6 +1325,9 @@ async def recalculate_user_stats(user_id: str):
     
     # Calcola statistiche
     total = len(movies)
+    if total == 0:
+        return
+        
     ratings = [m["rating"] for m in movies]
     avg_rating = sum(ratings) / total
     
@@ -868,6 +1337,9 @@ async def recalculate_user_stats(user_id: str):
     
     top_rated = sorted([m for m in movies if m["rating"] >= 4], key=lambda x: -x["rating"])[:10]
     top_rated_list = [{"Name": m["name"], "Year": m["year"], "Rating": m["rating"]} for m in top_rated]
+    
+    # Ricalcola anche statistiche avanzate
+    advanced = calculate_advanced_stats(movies)
     
     # Aggiorna statistiche
     stats_collection.update_one(
@@ -882,6 +1354,18 @@ async def recalculate_user_stats(user_id: str):
             "total_3_stars": rating_dist.get("3", 0),
             "total_2_stars": rating_dist.get("2", 0),
             "total_1_stars": rating_dist.get("1", 0),
+            "genre_data": advanced.get("genre_data", []),
+            "favorite_genre": advanced.get("favorite_genre", "Nessuno"),
+            "watch_time_hours": advanced.get("total_watch_time_hours", 0),
+            "watch_time_minutes": advanced.get("total_watch_time_minutes", 0),
+            "avg_duration": advanced.get("avg_duration", 0),
+            "top_directors": advanced.get("top_directors", []),
+            "top_actors": advanced.get("top_actors", []),
+            "best_rated_directors": advanced.get("best_rated_directors", []),
+            "best_rated_actors": advanced.get("best_rated_actors", []),
+            "rating_vs_imdb": advanced.get("rating_vs_imdb", []),
+            "total_unique_directors": advanced.get("total_unique_directors", 0),
+            "total_unique_actors": advanced.get("total_unique_actors", 0),
             "updated_at": datetime.utcnow().isoformat()
         }},
         upsert=True

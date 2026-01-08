@@ -1,13 +1,9 @@
 import { useState, useEffect } from 'react';
+import { catalogAPI, dataAPI, type MovieRating } from '../services/api';
+import { MovieModal } from '../components/MovieModal';
 import './FilmVisti.css';
 
-interface Movie {
-    name: string;
-    year: number;
-    rating: number;
-    date: string;
-    letterboxd_uri?: string;
-}
+interface Movie extends MovieRating {}
 
 interface MoviesByYear {
     [year: string]: Movie[];
@@ -20,24 +16,22 @@ export function FilmVisti() {
     const [expandedYears, setExpandedYears] = useState<Set<string>>(new Set());
     const [sortOrder, setSortOrder] = useState<'desc' | 'asc'>('desc');
     const [filterRating, setFilterRating] = useState<number | null>(null);
+    const [selectedMovie, setSelectedMovie] = useState<Movie | null>(null);
+    const [refreshTrigger, setRefreshTrigger] = useState(0);
 
     useEffect(() => {
-        fetch('http://localhost:8000/movies', {
-            headers: {
-                'Authorization': `Bearer ${localStorage.getItem('token')}`
-            }
-        })
-            .then(res => res.json())
+        dataAPI.getUserMovies()
             .then(data => {
-                setMovies(data);
-                groupByYear(data);
+                const moviesList = data.movies || [];
+                setMovies(moviesList);
+                groupByYear(moviesList);
                 setLoading(false);
             })
             .catch(err => {
                 console.error(err);
                 setLoading(false);
             });
-    }, []);
+    }, [refreshTrigger]);
 
     const groupByYear = (movieList: Movie[]) => {
         const grouped: MoviesByYear = {};
@@ -96,6 +90,38 @@ export function FilmVisti() {
             );
         }
         return stars;
+    };
+
+    const handleUpdate = async (rating: number, comment: string) => {
+        if (!selectedMovie) return;
+        try {
+            await catalogAPI.addOrUpdateMovie({
+                name: selectedMovie.name,
+                year: selectedMovie.year,
+                rating,
+                comment,
+                imdb_id: selectedMovie.imdb_id,
+                poster_url: selectedMovie.poster_url
+            });
+            setRefreshTrigger(prev => prev + 1);
+        } catch (error) {
+            console.error(error);
+            throw error;
+        }
+    };
+
+    const handleDelete = async () => {
+        if (!selectedMovie) return;
+        if (confirm(`Rimuovere "${selectedMovie.name}" dai tuoi visti?`)) {
+            try {
+                await catalogAPI.removeMovie(selectedMovie.name, selectedMovie.year);
+                setSelectedMovie(null);
+                setRefreshTrigger(prev => prev + 1);
+            } catch (error) {
+                console.error(error);
+                alert("Errore nella rimozione");
+            }
+        }
     };
 
     const getFilteredMovies = (yearMovies: Movie[]) => {
@@ -199,9 +225,12 @@ export function FilmVisti() {
                             {isExpanded && (
                                 <div className="movies-grid">
                                     {yearMovies.map((movie, index) => (
-                                        <div key={index} className="movie-card">
+                                        <div key={index} className="movie-card" onClick={() => setSelectedMovie(movie)}>
                                             <div className="movie-poster">
-                                                <div className="poster-placeholder">
+                                                {movie.poster_url ? (
+                                                    <img src={movie.poster_url} alt={movie.name} onError={(e) => { e.currentTarget.style.display = 'none'; }} />
+                                                ) : null}
+                                                <div className={`poster-placeholder ${movie.poster_url ? 'hidden' : ''}`}>
                                                     <span className="poster-icon">🎬</span>
                                                     <span className="poster-year">{movie.year}</span>
                                                 </div>
@@ -222,6 +251,11 @@ export function FilmVisti() {
                                                 <div className="movie-rating">
                                                     {renderStars(movie.rating)}
                                                 </div>
+                                                {movie.comment && (
+                                                    <div className="movie-comment-preview">
+                                                        "{movie.comment.slice(0, 40)}{movie.comment.length > 40 ? '...' : ''}"
+                                                    </div>
+                                                )}
                                                 <div className="movie-date">
                                                     {new Date(movie.date).toLocaleDateString('it-IT', {
                                                         day: 'numeric',
@@ -238,6 +272,16 @@ export function FilmVisti() {
                     );
                 })}
             </div>
+            {/* Modal Film Visto */}
+            {selectedMovie && (
+                <MovieModal
+                    movie={selectedMovie}
+                    mode="edit"
+                    onClose={() => setSelectedMovie(null)}
+                    onSave={handleUpdate}
+                    onDelete={handleDelete}
+                />
+            )}
         </div>
     );
 }

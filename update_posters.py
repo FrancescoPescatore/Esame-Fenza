@@ -142,3 +142,4 @@ if __name__ == "__main__":
         print("⚠️  ATTENZIONE: Devi inserire la tua API KEY di TMDB nello script!")
     else:
         main()
+ 

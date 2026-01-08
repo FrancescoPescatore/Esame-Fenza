@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, BarChart, Bar, ScatterChart, Scatter, ZAxis, Legend, ReferenceLine } from 'recharts';
 import { StatsCard } from '../components/StatsCard';
+import { MovieCard } from '../components/MovieCard';
 import './Dashboard.css';
 
 interface DashboardData {
@@ -16,8 +17,12 @@ interface DashboardData {
     watch_time_minutes?: number;
     avg_duration?: number;
     top_directors?: { name: string; count: number; avg_rating: number }[];
-    top_actors?: { name: string; count: number }[];
+    top_actors?: { name: string; count: number; avg_rating: number }[];
+    best_rated_directors?: { name: string; count: number; avg_rating: number }[];
+    best_rated_actors?: { name: string; count: number; avg_rating: number }[];
     rating_vs_imdb?: { title: string; user_rating: number; user_rating_10: number; imdb_rating: number; difference: number }[];
+    total_unique_directors?: number;
+    total_unique_actors?: number;
 }
 
 interface MonthlyStats {
@@ -37,6 +42,10 @@ export function Dashboard() {
     const [monthlyStats, setMonthlyStats] = useState<MonthlyStats | null>(null);
     const [activeRatingIndex, setActiveRatingIndex] = useState<number | null>(null);
     const [activeYearIndex, setActiveYearIndex] = useState<number | null>(null);
+    const [minMoviesFilter, setMinMoviesFilter] = useState<number>(1);
+    const [selectedPerson, setSelectedPerson] = useState<{name: string, type: 'director' | 'actor'} | null>(null);
+    const [personMovies, setPersonMovies] = useState<any[]>([]);
+    const [loadingPersonMovies, setLoadingPersonMovies] = useState(false);
     const fileInputRef = useRef<HTMLInputElement>(null);
 
     const fetchStats = () => {
@@ -80,6 +89,29 @@ export function Dashboard() {
                 }
             })
             .catch(err => console.error('Errore caricamento stats mensili:', err));
+    };
+
+    const fetchPersonMovies = (name: string, type: 'director' | 'actor') => {
+        setLoadingPersonMovies(true);
+        setSelectedPerson({ name, type });
+        setPersonMovies([]);
+        
+        fetch(`http://localhost:8000/movies/person?name=${encodeURIComponent(name)}&type=${type}`, {
+            headers: {
+                'Authorization': `Bearer ${localStorage.getItem('token')}`
+            }
+        })
+            .then(res => res.json())
+            .then(movies => {
+                if (Array.isArray(movies)) {
+                    setPersonMovies(movies);
+                }
+                setLoadingPersonMovies(false);
+            })
+            .catch(err => {
+                console.error('Errore caricamento film della persona:', err);
+                setLoadingPersonMovies(false);
+            });
     };
 
     useEffect(() => {
@@ -520,15 +552,17 @@ export function Dashboard() {
             )}
 
             {/* ============================================
-                SEZIONE 5: TOP REGISTI E ATTORI (NUOVO)
+                SEZIONE 5: REGISTI
                 ============================================ */}
+            <h2 className="section-title main-section-divider">🎬 Analisi Registi</h2>
             <div className="rankings-section">
-                {/* Top Registi */}
+                {/* Top Registi (Frequenza) */}
                 <div className="ranking-card">
-                    <h3>🎬 Top 5 Registi</h3>
+                    <h3>Registi Più Visti</h3>
+                    <p className="chart-subtitle">I registi di cui hai visto più opere</p>
                     <div className="ranking-list">
-                        {(displayData.top_directors || []).map((director, index) => (
-                            <div key={director.name} className="ranking-item">
+                        {(displayData.top_directors || []).slice(0, 10).map((director, index) => (
+                            <div key={director.name} className="ranking-item clickable" onClick={() => fetchPersonMovies(director.name, 'director')}>
                                 <span className="rank-position">#{index + 1}</span>
                                 <div className="rank-info">
                                     <span className="rank-name">{director.name}</span>
@@ -539,7 +573,7 @@ export function Dashboard() {
                                         className="rank-bar-fill" 
                                         style={{ 
                                             width: `${(director.count / (displayData.top_directors?.[0]?.count || 1)) * 100}%`,
-                                            background: yearColors[index % yearColors.length]
+                                            background: '#3b82f6'
                                         }}
                                     />
                                 </div>
@@ -551,23 +585,75 @@ export function Dashboard() {
                     </div>
                 </div>
 
-                {/* Top Attori */}
+                {/* Migliori Registi per Voto */}
                 <div className="ranking-card">
-                    <h3>🌟 Top 8 Attori</h3>
+                    <div className="ranking-card-header">
+                        <h3>Migliori per Voto Medio</h3>
+                        <div className="header-filter">
+                            {[1, 2, 3, 5].map(num => (
+                                <button 
+                                    key={num} 
+                                    className={`compact-filter-chip ${minMoviesFilter === num ? 'active' : ''}`}
+                                    onClick={() => setMinMoviesFilter(num)}
+                                >
+                                    {num}+
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+                    <p className="chart-subtitle">Ordinati per la tua media voto</p>
                     <div className="ranking-list">
-                        {(displayData.top_actors || []).map((actor, index) => (
-                            <div key={actor.name} className="ranking-item">
+                        {(displayData.best_rated_directors || [])
+                            .filter(d => d.count >= minMoviesFilter)
+                            .slice(0, 10) 
+                            .map((director, index) => (
+                            <div key={director.name} className="ranking-item clickable" onClick={() => fetchPersonMovies(director.name, 'director')}>
+                                <span className="rank-position">#{index + 1}</span>
+                                <div className="rank-info">
+                                    <span className="rank-name">{director.name}</span>
+                                    <span className="rank-stats">⭐ {director.avg_rating} media ({director.count} film)</span>
+                                </div>
+                                <div className="rank-bar">
+                                    <div 
+                                        className="rank-bar-fill" 
+                                        style={{ 
+                                            width: `${(director.avg_rating / 5) * 100}%`,
+                                            background: '#10b981'
+                                        }}
+                                    />
+                                </div>
+                            </div>
+                        ))}
+                        {(!(displayData.best_rated_directors || []).some(d => d.count >= minMoviesFilter)) && (
+                            <p className="no-data">Nessun regista con almeno {minMoviesFilter} film</p>
+                        )}
+                    </div>
+                </div>
+            </div>
+
+            {/* ============================================
+                SEZIONE 5bis: ATTORI
+                ============================================ */}
+            <h2 className="section-title main-section-divider">🌟 Analisi Attori</h2>
+            <div className="rankings-section">
+                {/* Top Attori (Frequenza) */}
+                <div className="ranking-card">
+                    <h3>Attori Più Visti</h3>
+                    <p className="chart-subtitle">I talenti che appaiono più spesso nei tuoi film</p>
+                    <div className="ranking-list">
+                        {(displayData.top_actors || []).slice(0, 10).map((actor, index) => (
+                            <div key={actor.name} className="ranking-item clickable" onClick={() => fetchPersonMovies(actor.name, 'actor')}>
                                 <span className="rank-position">#{index + 1}</span>
                                 <div className="rank-info">
                                     <span className="rank-name">{actor.name}</span>
-                                    <span className="rank-stats">{actor.count} film</span>
+                                    <span className="rank-stats">{actor.count} film • ⭐ {actor.avg_rating}</span>
                                 </div>
                                 <div className="rank-bar">
                                     <div 
                                         className="rank-bar-fill" 
                                         style={{ 
                                             width: `${(actor.count / (displayData.top_actors?.[0]?.count || 1)) * 100}%`,
-                                            background: `hsl(${index * 45}, 70%, 50%)`
+                                            background: '#ef4444'
                                         }}
                                     />
                                 </div>
@@ -575,6 +661,51 @@ export function Dashboard() {
                         ))}
                         {(!displayData.top_actors || displayData.top_actors.length === 0) && (
                             <p className="no-data">Dati non ancora disponibili</p>
+                        )}
+                    </div>
+                </div>
+
+                {/* Migliori Attori per Voto */}
+                <div className="ranking-card">
+                    <div className="ranking-card-header">
+                        <h3>Migliori per Voto Medio</h3>
+                        <div className="header-filter">
+                            {[1, 2, 3, 5].map(num => (
+                                <button 
+                                    key={num} 
+                                    className={`compact-filter-chip ${minMoviesFilter === num ? 'active' : ''}`}
+                                    onClick={() => setMinMoviesFilter(num)}
+                                >
+                                    {num}+
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+                    <p className="chart-subtitle">Talenti che apprezzi di più</p>
+                    <div className="ranking-list">
+                        {(displayData.best_rated_actors || [])
+                            .filter(a => a.count >= minMoviesFilter)
+                            .slice(0, 10)
+                            .map((actor, index) => (
+                            <div key={actor.name} className="ranking-item clickable" onClick={() => fetchPersonMovies(actor.name, 'actor')}>
+                                <span className="rank-position">#{index + 1}</span>
+                                <div className="rank-info">
+                                    <span className="rank-name">{actor.name}</span>
+                                    <span className="rank-stats">⭐ {actor.avg_rating} media ({actor.count} film)</span>
+                                </div>
+                                <div className="rank-bar">
+                                    <div 
+                                        className="rank-bar-fill" 
+                                        style={{ 
+                                            width: `${(actor.avg_rating / 5) * 100}%`,
+                                            background: '#8b5cf6'
+                                        }}
+                                    />
+                                </div>
+                            </div>
+                        ))}
+                        {(!(displayData.best_rated_actors || []).some(a => a.count >= minMoviesFilter)) && (
+                            <p className="no-data">Nessun attore con almeno {minMoviesFilter} film</p>
                         )}
                     </div>
                 </div>
@@ -597,10 +728,42 @@ export function Dashboard() {
                     <span className="quick-stat-label">Durata Media (min)</span>
                 </div>
                 <div className="quick-stat-card">
-                    <span className="quick-stat-value">{displayData.top_directors?.length || 0}</span>
+                    <span className="quick-stat-value">{displayData.total_unique_directors || displayData.top_directors?.length || 0}</span>
                     <span className="quick-stat-label">Registi Diversi</span>
                 </div>
             </div>
+
+            {/* ============================================
+                MODAL FILM PER PERSONA
+                ============================================ */}
+            {selectedPerson && (
+                <div className="person-modal-overlay" onClick={() => setSelectedPerson(null)}>
+                    <div className="person-modal-content" onClick={e => e.stopPropagation()}>
+                        <button className="close-modal" onClick={() => setSelectedPerson(null)}>&times;</button>
+                        
+                        <div className="modal-header">
+                            <h2>{selectedPerson.type === 'director' ? '🎬 Film di' : '🌟 Film con'} {selectedPerson.name}</h2>
+                            <p>Hai visto {personMovies.length} film con questo {selectedPerson.type === 'director' ? 'regista' : 'attore'}</p>
+                        </div>
+
+                        {loadingPersonMovies ? (
+                            <div className="modal-loading">
+                                <div className="spinner"></div>
+                                <p>Caricamento film...</p>
+                            </div>
+                        ) : (
+                            <div className="modal-movies-grid">
+                                {personMovies.map(movie => (
+                                    <MovieCard key={movie.id} movie={movie} />
+                                ))}
+                                {personMovies.length === 0 && !loadingPersonMovies && (
+                                    <p className="no-movies">Nessun film trovato.</p>
+                                )}
+                            </div>
+                        )}
+                    </div>
+                </div>
+            )}
         </div>
     );
 }

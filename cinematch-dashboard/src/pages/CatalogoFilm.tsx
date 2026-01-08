@@ -1,15 +1,9 @@
 import { useState, useEffect, useCallback } from 'react';
-import { catalogAPI, type CatalogMovie } from '../services/api';
+import { catalogAPI, type CatalogMovie, type MovieRating } from '../services/api';
+import { MovieModal } from '../components/MovieModal';
 import './CatalogoFilm.css';
 
-interface UserMovie {
-    name: string;
-    year: number;
-    rating: number;
-    date: string;
-    imdb_id?: string;
-    poster_url?: string;
-}
+interface UserMovie extends MovieRating {}
 
 interface MoviesByYear {
     [year: string]: UserMovie[];
@@ -23,10 +17,13 @@ export function CatalogoFilm() {
     const [searchQuery, setSearchQuery] = useState('');
     const [searchResults, setSearchResults] = useState<CatalogMovie[]>([]);
     const [isSearching, setIsSearching] = useState(false);
-    const [selectedMovie, setSelectedMovie] = useState<CatalogMovie | null>(null);
-    const [selectedRating, setSelectedRating] = useState(0);
+    const [selectedMovieForModal, setSelectedMovieForModal] = useState<CatalogMovie | UserMovie | null>(null);
+    const [modalMode, setModalMode] = useState<'view' | 'edit'>('view');
     const [showAddModal, setShowAddModal] = useState(false);
     const [addingMovie, setAddingMovie] = useState(false);
+
+    // Stato per il ricalcolo e refresh dati
+    const [refreshTrigger, setRefreshTrigger] = useState(0);
 
     // Stati per i film dell'utente (come FilmVisti originale)
     const [movies, setMovies] = useState<UserMovie[]>([]);
@@ -58,6 +55,13 @@ export function CatalogoFilm() {
             setLoading(false);
         }
     };
+
+    // Effetto per il refresh quando cambiano i dati
+    useEffect(() => {
+        if (refreshTrigger > 0) {
+            fetchUserMovies();
+        }
+    }, [refreshTrigger]);
 
     const groupByYear = (movieList: UserMovie[]) => {
         const grouped: MoviesByYear = {};
@@ -139,65 +143,67 @@ export function CatalogoFilm() {
         return () => clearTimeout(timer);
     }, [searchQuery, searchMovies]);
 
-    // Apri modal per aggiungere film
     const openAddModal = (movie: CatalogMovie) => {
         // Verifica se il film è già nella collezione
-        const alreadyAdded = movies.some(
+        const existing = movies.find(
             m => m.name.toLowerCase() === movie.title.toLowerCase() && m.year === movie.year
         );
         
-        if (alreadyAdded) {
-            alert('Hai già questo film nella tua collezione!');
-            return;
+        if (existing) {
+            setSelectedMovieForModal(existing);
+        } else {
+            setSelectedMovieForModal(movie);
         }
-
-        setSelectedMovie(movie);
-        setSelectedRating(0);
+        setModalMode('edit');
         setShowAddModal(true);
     };
 
-    // Aggiungi film alla collezione
-    const addMovieToCollection = async () => {
-        if (!selectedMovie || selectedRating === 0) {
-            alert('Seleziona un rating per il film!');
-            return;
-        }
+    const openEditModal = (movie: UserMovie) => {
+        setSelectedMovieForModal(movie);
+        setModalMode('edit');
+        setShowAddModal(true);
+    };
 
+    const addOrUpdateMovie = async (rating: number, comment: string) => {
+        if (!selectedMovieForModal) return;
+        
+        const name = 'title' in selectedMovieForModal ? selectedMovieForModal.title : selectedMovieForModal.name;
+        const year = selectedMovieForModal.year || 0;
+        
         setAddingMovie(true);
         try {
-            const response = await fetch('http://localhost:8000/user-movies/add', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${localStorage.getItem('token')}`
-                },
-                body: JSON.stringify({
-                    name: selectedMovie.title,
-                    year: selectedMovie.year,
-                    rating: selectedRating,
-                    imdb_id: selectedMovie.imdb_id,
-                    poster_url: selectedMovie.poster_url || STOCK_POSTER
-                })
+            await catalogAPI.addOrUpdateMovie({
+                name,
+                year,
+                rating,
+                comment,
+                imdb_id: (selectedMovieForModal as any).imdb_id,
+                poster_url: (selectedMovieForModal as any).poster_url
             });
-
-            if (!response.ok) {
-                throw new Error('Errore nell\'aggiunta del film');
-            }
-
-            // Ricarica la lista film
-            await fetchUserMovies();
-
             setShowAddModal(false);
-            setSelectedMovie(null);
-            setSearchQuery('');
-            setSearchResults([]);
-
-            alert(`"${selectedMovie.title}" aggiunto con ${selectedRating} stelle! ⭐`);
+            setRefreshTrigger(prev => prev + 1);
         } catch (error) {
-            console.error('Errore:', error);
-            alert('Errore nell\'aggiunta del film');
+            console.error('Errore durante il salvataggio:', error);
+            throw error;
         } finally {
             setAddingMovie(false);
+        }
+    };
+
+    const removeUserMovie = async () => {
+        if (!selectedMovieForModal) return;
+        const name = 'name' in selectedMovieForModal ? selectedMovieForModal.name : (selectedMovieForModal as CatalogMovie).title;
+        const year = selectedMovieForModal.year || 0;
+
+        if (confirm(`Rimuovere "${name}" dai tuoi visti?`)) {
+            try {
+                await catalogAPI.removeMovie(name, year);
+                setShowAddModal(false);
+                setRefreshTrigger(prev => prev + 1);
+            } catch (error) {
+                console.error('Errore durante la rimozione:', error);
+                alert("Errore nella rimozione");
+            }
         }
     };
 
@@ -412,7 +418,7 @@ export function CatalogoFilm() {
                                 {isExpanded && (
                                     <div className="movies-grid">
                                         {yearMovies.map((movie, index) => (
-                                            <div key={index} className="movie-card">
+                                            <div key={index} className="movie-card" onClick={() => openEditModal(movie)}>
                                                 <div className="movie-poster">
                                                     {movie.poster_url && movie.poster_url !== STOCK_POSTER ? (
                                                         <img 
@@ -435,13 +441,11 @@ export function CatalogoFilm() {
                                                     <div className="movie-rating">
                                                         {renderStars(movie.rating)}
                                                     </div>
-                                                    <div className="movie-date">
-                                                        {movie.date ? new Date(movie.date).toLocaleDateString('it-IT', {
-                                                            day: 'numeric',
-                                                            month: 'short',
-                                                            year: 'numeric'
-                                                        }) : ''}
-                                                    </div>
+                                                    {movie.comment && (
+                                                        <div className="movie-comment-preview">
+                                                            "{movie.comment.slice(0, 40)}{movie.comment.length > 40 ? '...' : ''}"
+                                                        </div>
+                                                    )}
                                                 </div>
                                             </div>
                                         ))}
@@ -453,92 +457,15 @@ export function CatalogoFilm() {
                 </div>
             )}
 
-            {/* Modal per aggiungere film */}
-            {showAddModal && selectedMovie && (
-                <div className="modal-overlay" onClick={() => setShowAddModal(false)}>
-                    <div className="add-movie-modal" onClick={(e) => e.stopPropagation()}>
-                        <button className="modal-close" onClick={() => setShowAddModal(false)}>
-                            ✕
-                        </button>
-                        
-                        <div className="modal-content">
-                            <div className="modal-poster">
-                                {selectedMovie.poster_url && !selectedMovie.poster_url.includes('placeholder') ? (
-                                    <img
-                                        src={selectedMovie.poster_url}
-                                        alt={selectedMovie.title}
-                                        onError={(e) => {
-                                            e.currentTarget.style.display = 'none';
-                                            const placeholder = e.currentTarget.nextElementSibling as HTMLElement;
-                                            if (placeholder) placeholder.classList.remove('hidden');
-                                        }}
-                                    />
-                                ) : null}
-                                <div className={`modal-poster-placeholder ${selectedMovie.poster_url && !selectedMovie.poster_url.includes('placeholder') ? 'hidden' : ''}`}>
-                                    <span className="poster-icon">🎬</span>
-                                    <span className="poster-year">{selectedMovie.year}</span>
-                                </div>
-                            </div>
-                            
-                            <div className="modal-info">
-                                <h2>{selectedMovie.title}</h2>
-                                <p className="modal-year">{selectedMovie.year}</p>
-                                
-                                {selectedMovie.genres && selectedMovie.genres.length > 0 && (
-                                    <div className="modal-genres">
-                                        {selectedMovie.genres.slice(0, 3).map(genre => (
-                                            <span key={genre} className="genre-tag">{genre}</span>
-                                        ))}
-                                    </div>
-                                )}
-                                
-                                {selectedMovie.description && (
-                                    <p className="modal-description">
-                                        {selectedMovie.description.slice(0, 200)}
-                                        {selectedMovie.description.length > 200 ? '...' : ''}
-                                    </p>
-                                )}
-                                
-                                {selectedMovie.director && (
-                                    <p className="modal-director">
-                                        <strong>Regia:</strong> {selectedMovie.director}
-                                    </p>
-                                )}
-                                
-                                <div className="rating-section">
-                                    <h3>Quanto ti è piaciuto?</h3>
-                                    <div className="rating-selector">
-                                        {[1, 2, 3, 4, 5].map(star => (
-                                            <span
-                                                key={star}
-                                                className={`rating-star ${star <= selectedRating ? 'selected' : ''}`}
-                                                onClick={() => setSelectedRating(star)}
-                                            >
-                                                ★
-                                            </span>
-                                        ))}
-                                    </div>
-                                    {selectedRating > 0 && (
-                                        <span className="rating-label">
-                                            {selectedRating === 5 ? 'Capolavoro!' :
-                                             selectedRating === 4 ? 'Ottimo!' :
-                                             selectedRating === 3 ? 'Buono' :
-                                             selectedRating === 2 ? 'Così così' : 'Non mi è piaciuto'}
-                                        </span>
-                                    )}
-                                </div>
-                                
-                                <button
-                                    className="add-btn"
-                                    onClick={addMovieToCollection}
-                                    disabled={selectedRating === 0 || addingMovie}
-                                >
-                                    {addingMovie ? '⏳ Aggiunta...' : '➕ Aggiungi alla Collezione'}
-                                </button>
-                            </div>
-                        </div>
-                    </div>
-                </div>
+            {/* Modal Film arricchito */}
+            {showAddModal && selectedMovieForModal && (
+                <MovieModal
+                    movie={selectedMovieForModal}
+                    mode={modalMode}
+                    onClose={() => setShowAddModal(false)}
+                    onSave={addOrUpdateMovie}
+                    onDelete={'name' in selectedMovieForModal ? removeUserMovie : undefined}
+                />
             )}
         </div>
     );

@@ -19,7 +19,14 @@ export interface MovieRating {
   year: number;
   rating: number;
   date: string;
+  comment?: string;
   letterboxdUri?: string;
+  poster_url?: string;
+  imdb_id?: string;
+  genres?: string[];
+  description?: string;
+  director?: string;
+  actors?: string;
 }
 
 export interface AuthResponse {
@@ -181,6 +188,10 @@ export interface CatalogMovie {
   votes?: number;
   poster_url: string;
   has_real_poster: boolean;
+  budget?: string;
+  worlwide_gross_income?: string;
+  production_company?: string;
+  link_imdb?: string;
 }
 
 export interface CatalogSearchResult {
@@ -256,8 +267,52 @@ export const catalogAPI = {
     return response.json();
   },
 
+  async addOrUpdateMovie(movie: {
+    name: string;
+    year: number;
+    rating: number;
+    comment?: string;
+    imdb_id?: string;
+    poster_url?: string;
+  }): Promise<{ status: string; message: string }> {
+    const response = await fetch(`${API_BASE_URL}/user-movies/add`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify(movie)
+    });
+    if (!response.ok) throw new Error('Errore nel salvataggio del film');
+    return response.json();
+  },
+
+  async updateUserMovie(req: {
+    name: string;
+    year: number;
+    rating?: number;
+    comment?: string;
+  }): Promise<{ status: string }> {
+    const response = await fetch(`${API_BASE_URL}/user-movies/update`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify(req)
+    });
+    if (!response.ok) throw new Error('Errore nell\'aggiornamento del film');
+    return response.json();
+  },
+
+  async removeMovie(name: string, year: number): Promise<{ status: string }> {
+    const response = await fetch(`${API_BASE_URL}/user-movies/remove`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ name, year })
+    });
+    if (!response.ok) throw new Error('Errore nella rimozione del film');
+    return response.json();
+  },
+
   // Helper per ottenere il poster con fallback
-  getPosterUrl(movie: CatalogMovie | { poster_url?: string }): string {
+  getPosterUrl(movie: CatalogMovie | MovieRating | { poster_url?: string }): string {
+    if ('poster_url' in movie && movie.poster_url) return movie.poster_url;
+    // @ts-ignore
     return movie?.poster_url || this.STOCK_POSTER_URL;
   }
 };
