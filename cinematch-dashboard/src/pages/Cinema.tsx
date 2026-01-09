@@ -135,15 +135,21 @@ export function Cinema() {
                 {/* Film Principale Selezionato */}
                 {selectedFilm && (
                     <div className="featured-movie">
-                        <div className="featured-poster">
-                            <img src={selectedFilm.poster} alt={selectedFilm.title} />
-                            {selectedFilm.rating && (
-                                <div className="poster-overlay">
-                                    <div className="rating-badge">
-                                        <span className="star">★</span> {selectedFilm.rating.toFixed(1)}
+                        <div className="featured-poster-container">
+                            <div className="featured-poster">
+                                <img 
+                                    src={selectedFilm.poster} 
+                                    alt={selectedFilm.title} 
+                                    loading="eager"
+                                />
+                                {selectedFilm.rating && (
+                                    <div className="poster-overlay">
+                                        <div className="rating-badge">
+                                            <span className="star">★</span> {selectedFilm.rating.toFixed(1)}
+                                        </div>
                                     </div>
-                                </div>
-                            )}
+                                )}
+                            </div>
                             <button className="btn-watched-under-poster" onClick={() => setIsWatchedModalOpen(true)}>
                                 Film già visto
                             </button>
@@ -218,7 +224,12 @@ export function Cinema() {
                                 className={`movie-list-item ${selectedFilm?.id === film.id ? 'active' : ''}`}
                                 onClick={() => setSelectedFilm(film)}
                             >
-                                <img src={film.poster} alt={film.title} className="list-poster" />
+                                <img 
+                                    src={film.poster} 
+                                    alt={film.title} 
+                                    className="list-poster" 
+                                    loading="lazy"
+                                />
                                 <div className="list-info">
                                     <h4>{film.title}</h4>
                                     <p>{film.genres.slice(0, 2).join(', ')}</p>
@@ -249,6 +260,7 @@ export function Cinema() {
                         genres: selectedFilm.genres
                     } as any}
                     mode="edit"
+                    hideDetailsButton={true}
                     onClose={() => setIsWatchedModalOpen(false)}
                     onSave={handleAddToWatched}
                 />

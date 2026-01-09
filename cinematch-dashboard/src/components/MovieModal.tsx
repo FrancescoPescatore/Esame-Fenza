@@ -9,9 +9,10 @@ interface MovieModalProps {
     onClose: () => void;
     onSave?: (rating: number, comment: string) => void;
     onDelete?: () => void;
+    hideDetailsButton?: boolean;
 }
 
-export function MovieModal({ movie, mode, onClose, onSave, onDelete }: MovieModalProps) {
+export function MovieModal({ movie, mode, onClose, onSave, onDelete, hideDetailsButton }: MovieModalProps) {
     const [rating, setRating] = useState(0);
     const [comment, setComment] = useState('');
     const [showScheda, setShowScheda] = useState(mode === 'view');
@@ -58,7 +59,7 @@ export function MovieModal({ movie, mode, onClose, onSave, onDelete }: MovieModa
                     <div className="detail-left">
                         <img src={poster} alt={title} className="detail-poster" />
                         
-                        {mode === 'edit' && (
+                        {(mode === 'edit' && !hideDetailsButton) && (
                             <div className="modal-sidebar-actions">
                                 <button 
                                     className="btn-scheda-toggle"

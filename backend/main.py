@@ -94,9 +94,13 @@ async def startup_event():
         movies_catalog.create_index("normalized_title")
         movies_catalog.create_index("normalized_original_title")
         
+        # Indici per showtimes
+        db.showtimes.create_index("province_slug")
+        db.showtimes.create_index("updated_at")
+        
         print("✅ Indici MongoDB creati")
     except Exception as e:
-        print(f"⚠️ Indici già esistenti: {e}")
+        print(f"⚠️ Errore creazione indici: {e}")
     
     # Controlla se c'è l'utente di default
     default_user = users_collection.find_one({"username": "pasquale.langellotti"})
@@ -626,6 +630,13 @@ async def get_cinema_films(current_user_id: str = Depends(get_current_user_id)):
     
     def find_in_catalog(title: str, original_title: str = None) -> dict:
         """Cerca un film nel catalogo con logica robusta usando i campi indicizzati."""
+        # Campi da restituire per velocizzare (MOLTO importante)
+        projection = {
+            "poster_url": 1, "description": 1, "avg_vote": 1, 
+            "genres": 1, "year": 1, "duration": 1, "actors": 1, 
+            "director": 1, "_id": 0
+        }
+        
         # 1. Ricerca esatta per titolo/titolo originale
         or_conditions = []
         if title:
@@ -645,7 +656,7 @@ async def get_cinema_films(current_user_id: str = Depends(get_current_user_id)):
             ])
 
         if or_conditions:
-            result = movies_catalog.find_one({"$or": or_conditions})
+            result = movies_catalog.find_one({"$or": or_conditions}, projection)
             if result:
                 return result
         
@@ -663,7 +674,7 @@ async def get_cinema_films(current_user_id: str = Depends(get_current_user_id)):
                     {"normalized_title": norm},
                     {"normalized_original_title": norm}
                 ]
-            })
+            }, projection)
             if result:
                 return result
             
@@ -674,7 +685,7 @@ async def get_cinema_films(current_user_id: str = Depends(get_current_user_id)):
                         {"normalized_title": {"$regex": f".*{re.escape(norm)}.*"}},
                         {"normalized_original_title": {"$regex": f".*{re.escape(norm)}.*"}}
                     ]
-                })
+                }, projection)
                 if result:
                     return result
 
@@ -691,31 +702,74 @@ async def get_cinema_films(current_user_id: str = Depends(get_current_user_id)):
     user_watched = list(movies_collection.find({"user_id": current_user_id}, {"name": 1}))
     watched_titles = {normalize_title(m['name']) for m in user_watched}
     
-    # Query showtimes per la provincia (prendiamo più film per permettere il filtraggio)
+    # Query showtimes per la provincia (prendiamo fino a 50 per avere margine dopo il filtraggio)
     showtimes_cursor = showtimes_collection.find(
         {"province_slug": user_province},
         {"_id": 0}
-    ).sort("updated_at", -1).limit(30)
+    ).sort("updated_at", -1).limit(50)
+    
+    showtimes_list = list(showtimes_cursor)
+    
+    # 1. Filtra per film non visti e raccogli titoli per ricerca batch
+    filtered_showtimes = []
+    titles_to_query = set()
+    
+    for st in showtimes_list:
+        ft = st.get("film_title", "")
+        fot = st.get("film_original_title", "")
+        nt = normalize_title(ft)
+        notit = normalize_title(fot) if fot else None
+        
+        if nt in watched_titles or (notit and notit in watched_titles):
+            continue
+            
+        filtered_showtimes.append(st)
+        if nt: titles_to_query.add(nt)
+        if notit: titles_to_query.add(notit)
+        
+        if len(filtered_showtimes) >= 20: # max_films
+            break
+
+    # 2. Ricerca batch nel catalogo (MOLTO più veloce di 20 query singole)
+    projection = {
+        "poster_url": 1, "description": 1, "avg_vote": 1, 
+        "genres": 1, "year": 1, "duration": 1, "actors": 1, 
+        "director": 1, "normalized_title": 1, "normalized_original_title": 1, "_id": 0
+    }
+    
+    catalog_results = list(movies_catalog.find({
+        "$or": [
+            {"normalized_title": {"$in": list(titles_to_query)}},
+            {"normalized_original_title": {"$in": list(titles_to_query)}}
+        ]
+    }, projection))
+    
+    # Crea mappa di lookup
+    catalog_map = {}
+    for item in catalog_results:
+        nt = item.get("normalized_title")
+        notit = item.get("normalized_original_title")
+        if nt: catalog_map[nt] = item
+        if notit: catalog_map[notit] = item
     
     films = []
-    max_films = 8 
-    
-    for showtime in showtimes_cursor:
-        if len(films) >= max_films:
-            break
-            
+    for showtime in filtered_showtimes:
         film_title = showtime.get("film_title", "")
         film_original_title = showtime.get("film_original_title", "")
         
-        # Salta se già visto
-        if normalize_title(film_title) in watched_titles or \
-           (film_original_title and normalize_title(film_original_title) in watched_titles):
-            continue
-            
-        director = showtime.get("director", "")
+        # Lookup in mappa
+        nt = normalize_title(film_title)
+        notit = normalize_title(film_original_title) if film_original_title else None
+        catalog_info = catalog_map.get(nt) or (catalog_map.get(notit) if notit else None)
         
-        # Cerca nel catalogo con logica robusta
-        catalog_info = find_in_catalog(film_title, film_original_title)
+        # Fallback alla funzione robusta se non trovato per match esatto normalizzato
+        if not catalog_info:
+            catalog_info = find_in_catalog(film_title, film_original_title)
+
+        director = showtime.get("director", "")
+        # Usa il regista dal catalogo se disponibile
+        if catalog_info and catalog_info.get("director"):
+            director = catalog_info.get("director")
 
         # Limita a 5 cinema per film
         cinemas = showtime.get("cinemas", [])[:5]
@@ -738,11 +792,11 @@ async def get_cinema_films(current_user_id: str = Depends(get_current_user_id)):
             "title": film_title,
             "original_title": film_original_title,
             "director": director,
-            "poster": catalog_info.get("poster_url") if catalog_info else None,
-            "description": catalog_info.get("description") if catalog_info else None,
+            "poster": catalog_info.get("poster_url") if (catalog_info and catalog_info.get("poster_url")) else "https://via.placeholder.com/500x750/1a1a2e/e50914?text=No+Poster",
+            "description": catalog_info.get("description") if catalog_info else "Trama non disponibile per questo film in programmazione.",
             "rating": catalog_info.get("avg_vote") if catalog_info else None,
-            "genres": catalog_info.get("genres", []) if catalog_info else [],
-            "year": catalog_info.get("year") if catalog_info else None,
+            "genres": catalog_info.get("genres", []) if catalog_info else ["In Sala"],
+            "year": catalog_info.get("year") if catalog_info else datetime.now().year,
             "duration": catalog_info.get("duration") if catalog_info else None,
             "actors": catalog_info.get("actors") if catalog_info else None,
             "cinemas": formatted_cinemas,
