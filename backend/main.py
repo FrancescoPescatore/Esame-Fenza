@@ -1764,11 +1764,15 @@ async def get_catalog_movies(
         query["avg_vote"] = {"$gte": min_rating}
     if search:
         norm_search = normalize_title(search)
+        # Use ^ to match only at the beginning as requested by the user
+        regex_search = f"^{re.escape(search)}"
+        regex_norm = f"^{re.escape(norm_search)}"
+        
         query["$or"] = [
-            {"title": {"$regex": search, "$options": "i"}},
-            {"original_title": {"$regex": search, "$options": "i"}},
-            {"normalized_title": {"$regex": norm_search, "$options": "i"}},
-            {"normalized_original_title": {"$regex": norm_search, "$options": "i"}},
+            {"title": {"$regex": regex_search, "$options": "i"}},
+            {"original_title": {"$regex": regex_search, "$options": "i"}},
+            {"normalized_title": {"$regex": regex_norm, "$options": "i"}},
+            {"normalized_original_title": {"$regex": regex_norm, "$options": "i"}},
             {"director": {"$regex": search, "$options": "i"}},
             {"actors": {"$regex": search, "$options": "i"}}
         ]
@@ -1815,12 +1819,16 @@ async def search_catalog(
 ):
     """Ricerca film nel catalogo per titolo."""
     norm_q = normalize_title(q)
+    # Use ^ to match only at the beginning as requested by the user
+    regex_q = f"^{re.escape(q)}"
+    regex_norm = f"^{re.escape(norm_q)}"
+    
     movies = list(movies_catalog.find(
         {"$or": [
-            {"title": {"$regex": q, "$options": "i"}},
-            {"original_title": {"$regex": q, "$options": "i"}},
-            {"normalized_title": {"$regex": norm_q, "$options": "i"}},
-            {"normalized_original_title": {"$regex": norm_q, "$options": "i"}}
+            {"title": {"$regex": regex_q, "$options": "i"}},
+            {"original_title": {"$regex": regex_q, "$options": "i"}},
+            {"normalized_title": {"$regex": regex_norm, "$options": "i"}},
+            {"normalized_original_title": {"$regex": regex_norm, "$options": "i"}}
         ]},
         {"_id": 0, "imdb_id": 1, "title": 1, "year": 1, "poster_url": 1, "avg_vote": 1, "genres": 1, "description": 1, "director": 1, "actors": 1, "duration": 1, "date_published": 1}
     ).sort([("date_published", -1), ("votes", -1)]).limit(limit))
