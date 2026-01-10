@@ -293,7 +293,10 @@ export const catalogAPI = {
       body: JSON.stringify(movie)
     });
     if (!response.ok) throw new Error('Errore nel salvataggio del film');
-    return response.json();
+    const result = await response.json();
+    // Emetti evento di aggiornamento
+    window.dispatchEvent(new Event('moviesUpdated'));
+    return result;
   },
 
   async updateUserMovie(req: {
@@ -308,7 +311,10 @@ export const catalogAPI = {
       body: JSON.stringify(req)
     });
     if (!response.ok) throw new Error('Errore nell\'aggiornamento del film');
-    return response.json();
+    const result = await response.json();
+    // Emetti evento di aggiornamento
+    window.dispatchEvent(new Event('moviesUpdated'));
+    return result;
   },
 
   async removeMovie(name: string, year: number): Promise<{ status: string }> {
@@ -318,7 +324,10 @@ export const catalogAPI = {
       body: JSON.stringify({ name, year })
     });
     if (!response.ok) throw new Error('Errore nella rimozione del film');
-    return response.json();
+    const result = await response.json();
+    // Emetti evento di aggiornamento
+    window.dispatchEvent(new Event('moviesUpdated'));
+    return result;
   },
 
   // Helper per ottenere il poster con fallback
