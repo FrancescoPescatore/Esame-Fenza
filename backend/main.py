@@ -649,6 +649,50 @@ async def get_current_user(current_user_id: str = Depends(get_current_user_id)):
     
     return user
 
+@app.post("/user/avatar")
+async def update_avatar(file: UploadFile = File(None), avatar_url: str = None, current_user_id: str = Depends(get_current_user_id)):
+    """Aggiorna l'avatar dell'utente (upload o URL preset)."""
+    import base64
+    
+    if file:
+        # Upload immagine (salva come base64 in MongoDB)
+        contents = await file.read()
+        # Limit size to 500KB
+        if len(contents) > 500000:
+            raise HTTPException(status_code=400, detail="Immagine troppo grande (max 500KB)")
+        
+        avatar_data = base64.b64encode(contents).decode('utf-8')
+        avatar_type = file.content_type or 'image/jpeg'
+        avatar_value = f"data:{avatar_type};base64,{avatar_data}"
+    elif avatar_url:
+        # URL preset
+        avatar_value = avatar_url
+    else:
+        raise HTTPException(status_code=400, detail="Fornisci un'immagine o un URL preset")
+    
+    users_collection.update_one(
+        {"user_id": current_user_id},
+        {"$set": {"avatar": avatar_value, "avatar_updated_at": datetime.utcnow().isoformat()}}
+    )
+    
+    return {"status": "success", "avatar": avatar_value}
+
+@app.get("/avatars/presets")
+async def get_preset_avatars():
+    """Restituisce lista di avatar predefiniti (personaggi iconici del cinema)."""
+    return [
+        {"id": 1, "name": "Al Pacino (Scarface)", "url": "https://wallpapers.com/images/hd/al-pacino-scarface-smoking-cigar-apphc77u4o6toj2p.jpg"},
+        {"id": 2, "name": "Joker (Joaquin Phoenix)", "url": "https://wallpapers.com/images/hd/art-of-joaquin-phoenix-joker-pfp-aa4tbtoqa72z6rf4.jpg"},
+        {"id": 3, "name": "It", "url": "https://m.media-amazon.com/images/M/MV5BMTg1NTU5NTgwOV5BMl5BanBnXkFtZTgwMTQ1NzMzMzI@._V1_.jpg"},
+        {"id": 4, "name": "Leonardo DiCaprio (The wolf of Wall Street)", "url": "https://d13jj08vfqimqg.cloudfront.net/uploads/article/header_marquee/2096/large_WOWS_leodicapriofist.jpg"},
+        {"id": 5, "name": "Harrison Ford (Indiana Jones)", "url": "https://www.hollywoodreporter.com/wp-content/uploads/2022/04/Harrison-Ford-Raiders-of-the-Lost-Ark-Everett-MSDRAOF_EC015-H-2022.jpg?w=1296&h=730&crop=1"},
+        {"id": 6, "name": "Audrey Hepburn (Colazione da Tiffany)", "url": "https://cdn.artphotolimited.com/images/5b9fc1ecac06024957be8806/1000x1000/audrey-hepburn-dans-breakfast-at-tiffany-s.jpg"},
+        {"id": 7, "name": "Uma Thurman (Pulp Fiction)", "url": "https://m.media-amazon.com/images/M/MV5BYzE3YzY4MTItZTQ4MC00MzBkLTk2YWUtZTJkMWY1ZjQ1MWFiXkEyXkFqcGc@._V1_QL75_UY281_CR0,0,500,281_.jpg"},
+        {"id": 8, "name": "Marilyn Monroe", "url": "https://www.arttimegallery.org/cdn/shop/files/IMG_7980.heic?v=1700695372&width=1445"},
+        {"id": 9, "name": "Ana de Armas", "url": "https://pbs.twimg.com/media/Ec2RTm5XgAISWIh.jpg"},
+        {"id": 10, "name": "Cat Woman", "url": "https://hips.hearstapps.com/hmg-prod/images/catwoman-storia-1647942111.jpeg?crop=1.00xw:0.663xh;0,0.0417xh&resize=640:*"}
+    ]
+
 # ============================================
 # CINEMA ENDPOINTS
 # ============================================
