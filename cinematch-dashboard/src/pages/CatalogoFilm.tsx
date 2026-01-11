@@ -3,7 +3,7 @@ import { catalogAPI, dataAPI, type CatalogMovie, type MovieRating } from '../ser
 import { MovieModal } from '../components/MovieModal';
 import './CatalogoFilm.css';
 
-interface UserMovie extends MovieRating {}
+interface UserMovie extends MovieRating { }
 
 interface MoviesByYear {
     [year: string]: UserMovie[];
@@ -67,12 +67,12 @@ export function CatalogoFilm() {
             }
             grouped[year].push(movie);
         });
-        
+
         // Ordina i film per rating all'interno di ogni anno
         Object.keys(grouped).forEach(year => {
             grouped[year].sort((a, b) => b.rating - a.rating);
         });
-        
+
         setGroupedMovies(grouped);
         // Espandi i primi 3 anni di default
         const years = Object.keys(grouped).sort((a, b) => parseInt(b) - parseInt(a));
@@ -99,8 +99,8 @@ export function CatalogoFilm() {
 
     const getSortedYears = () => {
         return Object.keys(groupedMovies).sort((a, b) => {
-            return sortOrder === 'desc' 
-                ? parseInt(b) - parseInt(a) 
+            return sortOrder === 'desc'
+                ? parseInt(b) - parseInt(a)
                 : parseInt(a) - parseInt(b);
         });
     };
@@ -143,7 +143,7 @@ export function CatalogoFilm() {
         const existing = movies.find(
             m => m.name.toLowerCase() === movie.title.toLowerCase() && m.year === movie.year
         );
-        
+
         if (existing) {
             setSelectedMovieForModal(existing);
         } else {
@@ -161,10 +161,10 @@ export function CatalogoFilm() {
 
     const addOrUpdateMovie = async (rating: number, comment: string) => {
         if (!selectedMovieForModal) return;
-        
+
         const name = 'title' in selectedMovieForModal ? selectedMovieForModal.title : selectedMovieForModal.name;
         const year = selectedMovieForModal.year || 0;
-        
+
         setAddingMovie(true);
         try {
             await catalogAPI.addOrUpdateMovie({
@@ -322,28 +322,16 @@ export function CatalogoFilm() {
                 <span>📚 La Tua Collezione</span>
             </div>
 
-            {/* Stats Bar - come originale */}
-            <div className="film-stats-bar">
-                <div className="stat-chip">
-                    <span className="stat-icon">🎬</span>
-                    <span>{totalMovies} film totali</span>
-                </div>
-                <div className="stat-chip">
-                    <span className="stat-icon">⭐</span>
-                    <span>Media {avgRating}/5</span>
-                </div>
-            </div>
-
-            {/* Controlli - come originale */}
+            {/* Controlli con Stats a destra */}
             <div className="controls-bar">
                 <div className="sort-controls">
-                    <button 
+                    <button
                         className={`control-btn ${sortOrder === 'desc' ? 'active' : ''}`}
                         onClick={() => setSortOrder('desc')}
                     >
                         Più recenti
                     </button>
-                    <button 
+                    <button
                         className={`control-btn ${sortOrder === 'asc' ? 'active' : ''}`}
                         onClick={() => setSortOrder('asc')}
                     >
@@ -353,14 +341,14 @@ export function CatalogoFilm() {
 
                 <div className="filter-controls">
                     <span className="filter-label">Filtra per rating:</span>
-                    <button 
+                    <button
                         className={`rating-filter ${filterRating === null ? 'active' : ''}`}
                         onClick={() => setFilterRating(null)}
                     >
                         Tutti
                     </button>
                     {[5, 4, 3, 2, 1].map(r => (
-                        <button 
+                        <button
                             key={r}
                             className={`rating-filter ${filterRating === r ? 'active' : ''}`}
                             onClick={() => setFilterRating(r)}
@@ -378,6 +366,17 @@ export function CatalogoFilm() {
                         Comprimi tutto
                     </button>
                 </div>
+
+                <div className="stats-inline">
+                    <div className="stat-chip">
+                        <span className="stat-icon">🎬</span>
+                        <span>{totalMovies} film totali</span>
+                    </div>
+                    <div className="stat-chip">
+                        <span className="stat-icon">⭐</span>
+                        <span>Media {avgRating}/5</span>
+                    </div>
+                </div>
             </div>
 
             {/* Film raggruppati per anno - COME ORIGINALE */}
@@ -392,13 +391,13 @@ export function CatalogoFilm() {
                     {sortedYears.map(year => {
                         const yearMovies = getFilteredMovies(groupedMovies[year]);
                         if (yearMovies.length === 0) return null;
-                        
+
                         const isExpanded = expandedYears.has(year);
                         const yearAvg = (yearMovies.reduce((sum, m) => sum + m.rating, 0) / yearMovies.length).toFixed(1);
 
                         return (
                             <div key={year} className="year-section">
-                                <div 
+                                <div
                                     className={`year-header ${isExpanded ? 'expanded' : ''}`}
                                     onClick={() => toggleYear(year)}
                                 >
@@ -416,8 +415,8 @@ export function CatalogoFilm() {
                                             <div key={index} className="movie-card" onClick={() => openEditModal(movie)}>
                                                 <div className="movie-poster">
                                                     {movie.poster_url && movie.poster_url !== STOCK_POSTER ? (
-                                                        <img 
-                                                            src={movie.poster_url} 
+                                                        <img
+                                                            src={movie.poster_url}
                                                             alt={movie.name}
                                                             onError={(e) => {
                                                                 e.currentTarget.style.display = 'none';
