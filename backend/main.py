@@ -2250,3 +2250,81 @@ async def get_catalog_stats():
         "top_genres": [{"name": g["_id"], "count": g["count"]} for g in top_genres],
         "by_decade": [{"decade": d["_id"], "count": d["count"]} for d in by_decade]
     }
+
+
+# ============================================
+# ADMIN STATS ENDPOINTS (per Grafana Infinity)
+# ============================================
+@app.get("/admin/stats")
+async def get_admin_stats():
+    """Statistiche globali per dashboard admin (Grafana Infinity)."""
+    # Conteggi principali
+    total_users = users_collection.count_documents({})
+    total_movies_catalog = movies_catalog.count_documents({})
+    total_watched = movies_collection.count_documents({})
+    
+    # Utenti per provincia
+    province_pipeline = [
+        {"$group": {"_id": "$province", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}}
+    ]
+    users_by_province = list(users_collection.aggregate(province_pipeline))
+    
+    # Top generi
+    genre_pipeline = [
+        {"$unwind": "$genres"},
+        {"$group": {"_id": "$genres", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}},
+        {"$limit": 10}
+    ]
+    top_genres = list(movies_catalog.aggregate(genre_pipeline))
+    
+    # Film per decennio
+    decade_pipeline = [
+        {"$match": {"year": {"$ne": None}}},
+        {"$group": {
+            "_id": {"$subtract": ["$year", {"$mod": ["$year", 10]}]},
+            "count": {"$sum": 1}
+        }},
+        {"$sort": {"_id": 1}}
+    ]
+    by_decade = list(movies_catalog.aggregate(decade_pipeline))
+    
+    # Rating medio globale
+    stats = list(stats_collection.find({}, {"avg_rating": 1}))
+    avg_ratings = [s.get("avg_rating", 0) for s in stats if s.get("avg_rating")]
+    global_avg_rating = round(sum(avg_ratings) / len(avg_ratings), 2) if avg_ratings else 0
+    
+    return {
+        "total_users": total_users,
+        "total_movies_catalog": total_movies_catalog,
+        "total_watched": total_watched,
+        "global_avg_rating": global_avg_rating,
+        "users_by_province": [{"province": p["_id"] or "N/A", "count": p["count"]} for p in users_by_province],
+        "top_genres": [{"genre": g["_id"], "count": g["count"]} for g in top_genres],
+        "movies_by_decade": [{"decade": d["_id"], "count": d["count"]} for d in by_decade]
+    }
+
+
+@app.get("/admin/stats/users")
+async def get_admin_users_stats():
+    """Lista utenti per tabella Grafana."""
+    users = list(users_collection.find(
+        {},
+        {"_id": 0, "username": 1, "email": 1, "province": 1, "movies_count": 1, "created_at": 1}
+    ).limit(100))
+    return users
+
+
+@app.get("/admin/stats/genres")
+async def get_admin_genres_stats():
+    """Distribuzione generi per grafico Grafana."""
+    pipeline = [
+        {"$unwind": "$genres"},
+        {"$group": {"_id": "$genres", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}},
+        {"$limit": 15}
+    ]
+    genres = list(movies_catalog.aggregate(pipeline))
+    return [{"genre": g["_id"], "count": g["count"]} for g in genres]
+

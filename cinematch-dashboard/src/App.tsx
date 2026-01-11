@@ -9,6 +9,7 @@ import { Sentiment } from './pages/Sentiment';
 import { Mood } from './pages/Mood';
 import { Predictions } from './pages/Predictions';
 import { Login, Register } from './pages/Auth';
+import { Admin } from './pages/Admin';
 import './styles/global.css';
 
 // Map routes to studio themes
@@ -45,6 +46,7 @@ function App() {
     <Router>
       <ThemeManager>
         <Routes>
+          <Route path="/admin" element={<Admin />} />
           <Route path="/login" element={<Login />} />
           <Route path="/register" element={<Register />} />
           <Route

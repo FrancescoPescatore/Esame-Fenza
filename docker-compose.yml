@@ -64,5 +64,24 @@ services:
     depends_on:
       - spark-master
 
+  # GRAFANA: Dashboard Analytics (usa Infinity plugin)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: cinematch_grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SECURITY_ALLOW_EMBEDDING=true
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      - GF_INSTALL_PLUGINS=yesoreyeram-infinity-datasource
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - backend
+
 volumes:
   mongo_data:
+  grafana_data:
