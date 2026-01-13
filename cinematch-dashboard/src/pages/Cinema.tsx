@@ -364,24 +364,16 @@ export function Cinema() {
                         ▶
                     </button>
 
-                    {/* Manual Refresh Button */}
-                    {(isTodayMissing || isRefreshing) && (
+                    {/* Manual Refresh Button - Hidden while refreshing to avoid redundancy */}
+                    {(isTodayMissing && !isRefreshing) && (
                         <button
                             className={`refresh-btn ${isRefreshing ? 'spinning' : ''}`}
                             onClick={handleRefreshClick}
                             disabled={isRefreshing}
                             title="Aggiorna programmazione film"
-                            style={{
-                                marginLeft: '15px',
-                                backgroundColor: isRefreshing ? '#666' : '#E50914',
-                                color: 'white',
-                                border: 'none',
-                                borderRadius: '4px',
-                                padding: '5px 10px',
-                                cursor: isRefreshing ? 'wait' : 'pointer'
-                            }}
                         >
-                            {isRefreshing ? '🔄 ...' : '🔄 Aggiorna Film'}
+                            <span className="icon">🔄</span>
+                            {isRefreshing ? 'Aggiornamento...' : 'Aggiorna Film'}
                         </button>
                     )}
                 </div>

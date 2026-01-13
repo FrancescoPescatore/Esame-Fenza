@@ -439,6 +439,64 @@
     font-size: 0.8rem;
 }
 
+/* Refresh Button */
+.refresh-btn {
+    margin-left: 15px;
+    background: linear-gradient(135deg, #e50914 0%, #b20710 100%);
+    color: white;
+    border: none;
+    border-radius: 20px;
+    padding: 8px 16px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    box-shadow: 0 4px 15px rgba(229, 9, 20, 0.4);
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.refresh-btn:hover:not(:disabled) {
+    transform: translateY(-2px);
+    box-shadow: 0 6px 20px rgba(229, 9, 20, 0.6);
+    background: linear-gradient(135deg, #f40612 0%, #d60812 100%);
+}
+
+.refresh-btn:active:not(:disabled) {
+    transform: translateY(0);
+}
+
+.refresh-btn:disabled {
+    background: #333;
+    color: #888;
+    cursor: wait;
+    box-shadow: none;
+    border: 1px solid #444;
+}
+
+.refresh-btn .icon {
+    display: inline-block;
+    font-size: 1.1rem;
+    line-height: 1;
+}
+
+.refresh-btn.spinning .icon {
+    animation: spinButton 1s linear infinite;
+}
+
+@keyframes spinButton {
+    from {
+        transform: rotate(0deg);
+    }
+
+    to {
+        transform: rotate(360deg);
+    }
+}
+
 /* Refreshing Badge */
 .refreshing-badge {
     display: inline-block;
