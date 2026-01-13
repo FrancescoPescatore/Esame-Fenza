@@ -21,7 +21,7 @@ from pymongo import MongoClient
 from pydantic import BaseModel
 from typing import Optional, List, Dict
 from auth import get_password_hash, verify_password, create_access_token, get_current_user_id
-from quiz_generator import get_daily_questions
+from quiz_generator import get_daily_questions, run_daily_quiz_generation
 from kafka_producer import get_kafka_producer
 
 # ============================================
@@ -2236,6 +2236,16 @@ async def generate_quiz_questions(background_tasks: BackgroundTasks, n: int = 5)
         "current_count": get_questions_count()
     }
 
+
+@app.get("/quiz/status")
+async def get_quiz_generation_status():
+    """Ritorna lo stato della generazione dei quiz."""
+    try:
+        status_doc = db.quiz_status.find_one({"_id": "daily_generation"})
+        status = status_doc.get("status", "IDLE") if status_doc else "IDLE"
+        return {"status": status}
+    except Exception as e:
+        return {"status": "error", "details": str(e)}
 
 
 @app.get("/quiz/history")

@@ -353,24 +353,68 @@ def save_questions_to_db(questions: List[Dict]) -> int:
 async def run_daily_quiz_generation():
     """Main task per produzione."""
     ensure_indexes()
-    questions = await generate_daily_questions(5)
-    return save_questions_to_db(questions)
+    
+    # 1. Update status to IN_PROGRESS
+    try:
+        db.quiz_status.update_one(
+            {"_id": "daily_generation"},
+            {
+                "$set": {
+                    "status": "IN_PROGRESS",
+                    "updated_at": datetime.now(pytz.timezone('Europe/Rome'))
+                }
+            },
+            upsert=True
+        )
+        
+        questions = await generate_daily_questions(5)
+        save_questions_to_db(questions)
+        
+    except Exception as e:
+        print(f"Error during quiz generation: {e}")
+        # Could log error to DB here too
+    finally:
+        # 2. Update status to IDLE (always, even if error)
+        db.quiz_status.update_one(
+            {"_id": "daily_generation"},
+            {
+                "$set": {
+                    "status": "IDLE",
+                    "updated_at": datetime.now(pytz.timezone('Europe/Rome'))
+                }
+            },
+            upsert=True
+        )
 
 def get_daily_questions(n: int = 5) -> List[Dict]:
-    """Ritorna le domande di oggi (basato su quiz_date, ora italiana)."""
+    """
+    Ritorna le domande di oggi.
+    Se mancano, cerca le prime disponibili nel futuro (es. domani).
+    Se mancano anche quelle, torna lista vuota (segnale per il frontend di mostrare 'Genera').
+    """
     italy_tz = pytz.timezone('Europe/Rome')
     today_str = datetime.now(italy_tz).strftime("%Y-%m-%d")
+    
+    # 1. Cerca quiz di OGGI
     questions = list(quiz_questions.find({"quiz_date": today_str}, {"_id": 0}).limit(n))
     
-    if len(questions) < n:
-        additional = list(
-            quiz_questions.find({}, {"_id": 0})
-            .sort([("used_count", 1), ("created_at", -1)])
-            .limit(n - len(questions))
-        )
-        questions.extend(additional)
+    if questions:
+        return questions
+
+    # 2. Se non ci sono quiz oggi, cerca quiz FUTURI (es. domani)
+    # Ordinati per data crescente -> prendi il primo gruppo disponibile (next available day)
+    # Nota: questo prende le prime N domande future in assoluto. 
+    # Se ci sono 5 domande per domani, prenderà quelle.
+    future_questions = list(quiz_questions.find(
+        {"quiz_date": {"$gt": today_str}}, 
+        {"_id": 0}
+    ).sort([("quiz_date", 1), ("created_at", 1)]).limit(n))
     
-    return questions
+    if future_questions:
+        return future_questions
+        
+    # 3. Nessun quiz -> Ritorna vuoto per attivare il pulsante "Genera" nel frontend
+    return []
 
 def get_questions_count() -> int:
     """Ritorna il numero totale di domande nel DB."""

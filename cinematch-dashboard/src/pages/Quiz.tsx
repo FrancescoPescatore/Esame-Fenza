@@ -11,34 +11,10 @@ export function Quiz() {
     const [showResult, setShowResult] = useState(false);
     const [isAnswered, setIsAnswered] = useState(false);
     const [quizComplete, setQuizComplete] = useState(false);
+    const [isGenerating, setIsGenerating] = useState(false);
+    const [generationStatus, setGenerationStatus] = useState<string>("");
 
-    useEffect(() => {
-        fetchQuestions();
-    }, []);
 
-    const fetchQuestions = async () => {
-        try {
-            setLoading(true);
-            const response = await fetch('http://localhost:8000/quiz/questions');
-            if (!response.ok) throw new Error('Failed to fetch questions');
-
-            const data = await response.json();
-
-            if (Array.isArray(data)) {
-                setQuestions(data);
-            } else if (data.questions && Array.isArray(data.questions)) {
-                setQuestions(data.questions);
-            } else {
-                setQuestions([]);
-                console.log("No questions available:", data);
-            }
-        } catch (err) {
-            setError(err instanceof Error ? err.message : 'Something went wrong');
-            console.error("Quiz fetch error:", err);
-        } finally {
-            setLoading(false);
-        }
-    };
 
     useEffect(() => {
         setSelectedAnswer(null);
@@ -108,6 +84,119 @@ export function Quiz() {
         fetchQuestions();
     };
 
+    const startPolling = () => {
+        setIsGenerating(true);
+        setLoading(true);
+        setGenerationStatus("AI is writing questions... (this takes ~30s)");
+
+        let attempts = 0;
+        const maxAttempts = 24; // 120 seconds max
+
+        const pollInterval = setInterval(async () => {
+            attempts++;
+            try {
+                // Check if process is still running or if questions are ready
+                const statusRes = await fetch('http://localhost:8000/quiz/status');
+                const statusData = await statusRes.json();
+
+                if (statusData.status === "IDLE") {
+                    // Generation finished (success or fail), try to get questions
+                    const qRes = await fetch('http://localhost:8000/quiz/questions');
+                    const qData = await qRes.json();
+
+                    if (qData.questions && qData.questions.length > 0) {
+                        clearInterval(pollInterval);
+                        setQuestions(qData.questions);
+                        setLoading(false);
+                        setIsGenerating(false);
+                    } else {
+                        // Finished but no questions? Error or empty
+                        clearInterval(pollInterval);
+                        setLoading(false);
+                        setIsGenerating(false);
+                        // Don't set error, just show empty state so user can try again
+                    }
+                }
+
+                // If still IN_PROGRESS, continue polling
+
+                if (attempts >= maxAttempts) {
+                    clearInterval(pollInterval);
+                    setLoading(false);
+                    setIsGenerating(false);
+                    setError("Generation timed out. Please try again manually.");
+                }
+            } catch (e) {
+                console.error("Polling error", e);
+            }
+        }, 5000);
+    };
+
+    const fetchQuestions = async () => {
+        try {
+            setLoading(true);
+            const response = await fetch('http://localhost:8000/quiz/questions');
+            if (!response.ok) throw new Error('Failed to fetch questions');
+
+            const data = await response.json();
+            let hasQuestions = false;
+
+            if (Array.isArray(data) && data.length > 0) {
+                setQuestions(data);
+                hasQuestions = true;
+            } else if (data.questions && Array.isArray(data.questions) && data.questions.length > 0) {
+                setQuestions(data.questions);
+                hasQuestions = true;
+            } else {
+                setQuestions([]);
+            }
+
+            if (hasQuestions) {
+                setLoading(false);
+            } else {
+                console.log("No questions available, checking generation status...");
+                // Check if generation is in progress
+                const statusRes = await fetch('http://localhost:8000/quiz/status');
+                const statusData = await statusRes.json();
+
+                if (statusData.status === "IN_PROGRESS") {
+                    startPolling();
+                } else {
+                    setLoading(false);
+                }
+            }
+        } catch (err) {
+            setError(err instanceof Error ? err.message : 'Something went wrong');
+            console.error("Quiz fetch error:", err);
+            setLoading(false);
+        }
+    };
+
+    const generateQuestions = async () => {
+        try {
+            setLoading(true);
+            setIsGenerating(true);
+            setGenerationStatus("Starting generation...");
+
+            const response = await fetch('http://localhost:8000/quiz/generate', {
+                method: 'POST'
+            });
+            const data = await response.json();
+            console.log("Generation started:", data);
+
+            startPolling();
+
+        } catch (err) {
+            setError("Failed to start generation");
+            setLoading(false);
+            setIsGenerating(false);
+        }
+    };
+
+    useEffect(() => {
+        fetchQuestions();
+    }, []);
+
     const getButtonClass = (answer: { id: string; isCorrect: boolean }) => {
         if (!showResult) return '';
         if (answer.id === selectedAnswer) {
@@ -120,8 +209,9 @@ export function Quiz() {
     if (loading) return (
         <div className="quiz-page">
             <div className="quiz-card">
-                <h1>Loading Quiz... 🎬</h1>
-                <p>Generating fresh questions for you...</p>
+                <h1>{isGenerating ? "AI at Work... 🤖" : "Loading Quiz..."}</h1>
+                <p>{isGenerating ? generationStatus : "Generating fresh questions for you..."}</p>
+                {isGenerating && <div className="spinner" style={{ margin: '20px auto' }}></div>}
             </div>
         </div>
     );
@@ -139,9 +229,20 @@ export function Quiz() {
     if (questions.length === 0) return (
         <div className="quiz-page">
             <div className="quiz-card">
-                <h1>No questions for today yet! 🍿</h1>
-                <p>Check back later or check the backend generation.</p>
-                <button className="restart-btn" onClick={fetchQuestions}>Check Again</button>
+                <h1>Nessun quiz per oggi! 🍿</h1>
+                <p>Non ci sono ancora quiz pronti. Vuoi generarne di nuovi con l'AI?</p>
+                <div style={{ display: 'flex', gap: '15px', justifyContent: 'center', marginTop: '20px' }}>
+                    <button className="restart-btn" onClick={fetchQuestions}>
+                        🔄 Ricarica
+                    </button>
+                    <button
+                        className="restart-btn"
+                        onClick={generateQuestions}
+                        style={{ backgroundColor: '#E50914', color: 'white', border: 'none' }}
+                    >
+                        ✨ Genera Ora
+                    </button>
+                </div>
             </div>
         </div>
     );
