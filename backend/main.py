@@ -1261,14 +1261,15 @@ async def get_user_stats(current_user_id: str = Depends(get_current_user_id)):
     stats["total_watched"] = real_count
     
     # 4. Sync Status Check
+    # Default to "synced" - only show "syncing" if there's an explicit pending update
     sync_status = "synced"
     user = users_collection.find_one({"user_id": current_user_id}, {"last_interaction": 1})
-    if user and user.get("last_interaction"):
+    stats_updated = stats.get("updated_at")
+    
+    if user and user.get("last_interaction") and stats_updated:
+        # Both timestamps exist - compare them
         last_interaction = user.get("last_interaction")
-        stats_updated = stats.get("updated_at")
-        
-        # Se l'interazione è più recente dell'aggiornamento stats -> Syncing
-        if not stats_updated or last_interaction > stats_updated:
+        if last_interaction > stats_updated:
             sync_status = "syncing"
     
     stats["sync_status"] = sync_status
@@ -2373,11 +2374,35 @@ async def generate_quiz_questions(background_tasks: BackgroundTasks, n: int = 5)
 
 @app.get("/quiz/status")
 async def get_quiz_generation_status():
-    """Ritorna lo stato della generazione dei quiz."""
+    """Ritorna lo stato completo della generazione dei quiz."""
     try:
         status_doc = db.quiz_status.find_one({"_id": "daily_generation"})
-        status = status_doc.get("status", "IDLE") if status_doc else "IDLE"
-        return {"status": status}
+        if not status_doc:
+            return {
+                "status": "FINISHED",
+                "last_generated_date": None,
+                "needs_generation": True
+            }
+        
+        status = status_doc.get("status", "FINISHED")
+        last_date = status_doc.get("last_generated_date")
+        today_str = datetime.now(italy_tz).strftime("%Y-%m-%d")
+        
+        # Frontend può usare needs_generation per decidere se mostrare il pulsante
+        needs_generation = (
+            status in ["FINISHED", "ERROR", "IDLE"] and 
+            last_date != today_str
+        )
+        
+        return {
+            "status": status,
+            "last_generated_date": last_date,
+            "questions_generated": status_doc.get("questions_generated", 0),
+            "finished_at": status_doc.get("finished_at"),
+            "error_message": status_doc.get("error_message"),
+            "needs_generation": needs_generation,
+            "today": today_str
+        }
     except Exception as e:
         return {"status": "error", "details": str(e)}
 

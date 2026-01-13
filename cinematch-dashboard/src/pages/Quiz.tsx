@@ -99,7 +99,8 @@ export function Quiz() {
                 const statusRes = await fetch('http://localhost:8000/quiz/status');
                 const statusData = await statusRes.json();
 
-                if (statusData.status === "IDLE") {
+                // Check if generation is complete (FINISHED, ERROR, or any non-GENERATING status)
+                if (statusData.status !== "GENERATING") {
                     // Generation finished (success or fail), try to get questions
                     const qRes = await fetch('http://localhost:8000/quiz/questions');
                     const qData = await qRes.json();
@@ -118,7 +119,7 @@ export function Quiz() {
                     }
                 }
 
-                // If still IN_PROGRESS, continue polling
+                // If still GENERATING, continue polling
 
                 if (attempts >= maxAttempts) {
                     clearInterval(pollInterval);
@@ -159,9 +160,11 @@ export function Quiz() {
                 const statusRes = await fetch('http://localhost:8000/quiz/status');
                 const statusData = await statusRes.json();
 
-                if (statusData.status === "IN_PROGRESS") {
+                if (statusData.status === "GENERATING") {
+                    // Still generating, start polling
                     startPolling();
                 } else {
+                    // Finished, Error, or other - show loading false so Generate button appears
                     setLoading(false);
                 }
             }

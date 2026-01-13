@@ -622,11 +622,11 @@ def main():
         .select(from_json(col("json_value"), event_schema).alias("data")) \
         .select("data.*")
     
-    # Trigger elaborazione ogni 30 secondi
+    # Trigger elaborazione ogni 5 secondi (sync quasi istantaneo)
     query = parsed_stream.writeStream \
         .foreachBatch(process_batch) \
         .outputMode("update") \
-        .trigger(processingTime="30 seconds") \
+        .trigger(processingTime="5 seconds") \
         .start()
     
     logger.info("✅ Streaming avviato. In attesa di eventi...")

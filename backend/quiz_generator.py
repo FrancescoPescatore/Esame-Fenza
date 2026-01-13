@@ -353,34 +353,55 @@ def save_questions_to_db(questions: List[Dict]) -> int:
 async def run_daily_quiz_generation():
     """Main task per produzione."""
     ensure_indexes()
+    italy_tz = pytz.timezone('Europe/Rome')
+    today_str = datetime.now(italy_tz).strftime("%Y-%m-%d")
     
-    # 1. Update status to IN_PROGRESS
+    # Check if already generating (prevent concurrent runs)
+    current_status = db.quiz_status.find_one({"_id": "daily_generation"})
+    if current_status and current_status.get("status") == "GENERATING":
+        logger.warning("⚠️ Quiz generation already in progress, skipping...")
+        return
+    
+    # 1. Update status to GENERATING
     try:
         db.quiz_status.update_one(
             {"_id": "daily_generation"},
             {
                 "$set": {
-                    "status": "IN_PROGRESS",
-                    "updated_at": datetime.now(pytz.timezone('Europe/Rome'))
+                    "status": "GENERATING",
+                    "started_at": datetime.now(italy_tz).isoformat()
                 }
             },
             upsert=True
         )
         
         questions = await generate_daily_questions(5)
-        save_questions_to_db(questions)
+        saved_count = save_questions_to_db(questions)
         
-    except Exception as e:
-        print(f"Error during quiz generation: {e}")
-        # Could log error to DB here too
-    finally:
-        # 2. Update status to IDLE (always, even if error)
+        # 2. Update status to FINISHED with date
         db.quiz_status.update_one(
             {"_id": "daily_generation"},
             {
                 "$set": {
-                    "status": "IDLE",
-                    "updated_at": datetime.now(pytz.timezone('Europe/Rome'))
+                    "status": "FINISHED",
+                    "last_generated_date": today_str,
+                    "questions_generated": saved_count,
+                    "finished_at": datetime.now(italy_tz).isoformat()
+                }
+            },
+            upsert=True
+        )
+        
+    except Exception as e:
+        print(f"Error during quiz generation: {e}")
+        # Set status to ERROR so frontend knows something went wrong
+        db.quiz_status.update_one(
+            {"_id": "daily_generation"},
+            {
+                "$set": {
+                    "status": "ERROR",
+                    "error_message": str(e),
+                    "finished_at": datetime.now(italy_tz).isoformat()
                 }
             },
             upsert=True
