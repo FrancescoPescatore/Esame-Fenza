@@ -19,9 +19,12 @@ interface DashboardData {
     rating_chart_data?: { rating: string; count: number; stars: number }[];
     watch_time_hours?: number;
     avg_duration?: number;
-    // Attori e Registi (unica fonte, frontend deriva le viste)
-    best_rated_directors?: { name: string; count: number; avg_rating: number }[];
-    best_rated_actors?: { name: string; count: number; avg_rating: number }[];
+    // Attori e Registi Ottimizzati (v3.2)
+    most_watched_directors?: { name: string; count: number; avg_rating: number }[];
+    most_watched_actors?: { name: string; count: number; avg_rating: number }[];
+    best_rated_directors?: { [key: string]: { name: string; count: number; avg_rating: number }[] } | { name: string; count: number; avg_rating: number }[];
+    best_rated_actors?: { [key: string]: { name: string; count: number; avg_rating: number }[] } | { name: string; count: number; avg_rating: number }[];
+
     rating_vs_imdb?: { title: string; user_rating: number; user_rating_10: number; imdb_rating: number; difference: number }[];
     // Quiz stats
     quiz_correct_count?: number;
@@ -190,7 +193,7 @@ export function Dashboard() {
         // Polling per sync status se in corso
         const interval = setInterval(() => {
             if (syncing) fetchStats();
-        }, 5000); // Check ogni 5s se sta sincronizzando
+        }, 1000); // Check ogni 1s se sta sincronizzando
 
         return () => clearInterval(interval);
     }, [syncing]);
@@ -322,13 +325,18 @@ export function Dashboard() {
         rating_vs_imdb: []
     };
 
-    // Deriva top_actors e top_directors da best_rated_* (ordinati per count)
-    const topDirectors = [...(displayData.best_rated_directors || [])]
-        .sort((a, b) => b.count - a.count)
-        .slice(0, 15);
-    const topActors = [...(displayData.best_rated_actors || [])]
-        .sort((a, b) => b.count - a.count)
-        .slice(0, 15);
+    // Deriva top_actors e top_directors da most_watched_* (se presenti) o fallback su best_rated_* (old)
+    const topDirectors = displayData.most_watched_directors
+        ? displayData.most_watched_directors.slice(0, 15)
+        : (Array.isArray(displayData.best_rated_directors)
+            ? [...displayData.best_rated_directors].sort((a, b) => b.count - a.count).slice(0, 15)
+            : []);
+
+    const topActors = displayData.most_watched_actors
+        ? displayData.most_watched_actors.slice(0, 15)
+        : (Array.isArray(displayData.best_rated_actors)
+            ? [...displayData.best_rated_actors].sort((a, b) => b.count - a.count).slice(0, 15)
+            : []);
 
     // Colori per le barre
     const yearColors = ['#E50914', '#FF6B35', '#00529B', '#8B5CF6', '#06B6D4'];
@@ -388,6 +396,21 @@ export function Dashboard() {
         setHideQuizStats(newValue);
         localStorage.setItem('hideQuizStats', String(newValue));
     };
+
+    // Prepare lists for rendering (Fixing syntax error by moving logic out of JSX)
+    const currentFilterKey = String(minMoviesFilter);
+
+    const filteredDirectors = !Array.isArray(displayData.best_rated_directors) && displayData.best_rated_directors
+        ? (displayData.best_rated_directors as any)[currentFilterKey] || []
+        : (displayData.best_rated_directors as any[] || [])
+            .filter(d => d.count >= minMoviesFilter)
+            .slice(0, 10);
+
+    const filteredActors = !Array.isArray(displayData.best_rated_actors) && displayData.best_rated_actors
+        ? (displayData.best_rated_actors as any)[currentFilterKey] || []
+        : (displayData.best_rated_actors as any[] || [])
+            .filter(a => a.count >= minMoviesFilter)
+            .slice(0, 10);
 
     return (
         <div className="dashboard-page">
@@ -791,10 +814,8 @@ export function Dashboard() {
                     </div>
                     <p className="chart-subtitle">Ordinati per la tua media voto</p>
                     <div className="ranking-list">
-                        {(displayData.best_rated_directors || [])
-                            .filter(d => d.count >= minMoviesFilter)
-                            .slice(0, 10)
-                            .map((director, index) => (
+                        <div className="ranking-list">
+                            {filteredDirectors.map((director: any, index: number) => (
                                 <div key={director.name} className="ranking-item clickable" onClick={() => fetchPersonMovies(director.name, 'director')}>
                                     <span className="rank-position">#{index + 1}</span>
                                     <div className="rank-info">
@@ -812,9 +833,10 @@ export function Dashboard() {
                                     </div>
                                 </div>
                             ))}
-                        {(!(displayData.best_rated_directors || []).some(d => d.count >= minMoviesFilter)) && (
-                            <p className="no-data">Nessun regista con almeno {minMoviesFilter} film</p>
-                        )}
+                            {filteredDirectors.length === 0 && (
+                                <p className="no-data">Nessun regista con almeno {minMoviesFilter} film</p>
+                            )}
+                        </div>
                     </div>
                 </div>
             </div>
@@ -871,10 +893,8 @@ export function Dashboard() {
                     </div>
                     <p className="chart-subtitle">Talenti che apprezzi di più</p>
                     <div className="ranking-list">
-                        {(displayData.best_rated_actors || [])
-                            .filter(a => a.count >= minMoviesFilter)
-                            .slice(0, 10)
-                            .map((actor, index) => (
+                        <div className="ranking-list">
+                            {filteredActors.map((actor: any, index: number) => (
                                 <div key={actor.name} className="ranking-item clickable" onClick={() => fetchPersonMovies(actor.name, 'actor')}>
                                     <span className="rank-position">#{index + 1}</span>
                                     <div className="rank-info">
@@ -892,9 +912,10 @@ export function Dashboard() {
                                     </div>
                                 </div>
                             ))}
-                        {(!(displayData.best_rated_actors || []).some(a => a.count >= minMoviesFilter)) && (
-                            <p className="no-data">Nessun attore con almeno {minMoviesFilter} film</p>
-                        )}
+                            {filteredActors.length === 0 && (
+                                <p className="no-data">Nessun attore con almeno {minMoviesFilter} film</p>
+                            )}
+                        </div>
                     </div>
                 </div>
             </div>

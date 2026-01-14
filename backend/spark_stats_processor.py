@@ -91,76 +91,164 @@ def create_spark_session():
         .getOrCreate()
 
 
+
+
+def process_partition(iterator):
+    """
+    Funzione eseguita sui worker Spark (dentro foreachPartition).
+    Processa un iteratore di Row e scrive su MongoDB in bulk.
+    Ottimizzazione V2: READ BATCHING ($in query)
+    """
+    from pymongo import MongoClient, UpdateOne, DeleteOne
+    import pytz
+    from datetime import datetime
+    
+    # Crea connessione per PARTIZIONE
+    client = MongoClient(MONGODB_URL)
+    db = client.cinematch_db
+    
+    # Parametri batching
+    READ_BATCH_SIZE = 500
+    
+    # Accumula user_ids e rows
+    user_rows_buffer = [] 
+    
+    try:
+        # Converti iteratore in lista (necessario per batching, attenzione alla memoria ma le partizioni sono piccole)
+        all_rows = list(iterator)
+        if not all_rows:
+            return iter([])
+
+        # Processa a blocchi di READ_BATCH_SIZE
+        for i in range(0, len(all_rows), READ_BATCH_SIZE):
+            chunk = all_rows[i : i + READ_BATCH_SIZE]
+            user_ids_chunk = [r.user_id for r in chunk]
+            
+            # --- BATCH READ MOVIES ---
+            # Recupera film per TUTTI gli utenti del chunk in UNA query
+            movies_cursor = db.movies.find({"user_id": {"$in": user_ids_chunk}})
+            
+            # Raggruppa film per user_id in memoria e raccogli TUTTI i titoli per il catalogo
+            movies_by_user = {}
+            all_titles_set = set()
+            
+            for m in movies_cursor:
+                uid = m.get("user_id")
+                if uid not in movies_by_user:
+                    movies_by_user[uid] = []
+                movies_by_user[uid].append(m)
+                
+                if m.get('name'):
+                    all_titles_set.add(m.get('name'))
+            
+            # --- BATCH READ CATALOG ---
+            # Unica query al catalogo per tutti i film del chunk (max 500 utenti * N film)
+            # Ottimizzazione V3
+            master_catalog_map = {}
+            if all_titles_set:
+                try:
+                    all_titles_list = list(all_titles_set)
+                    normalized_titles_list = [normalize_title(t) for t in all_titles_list]
+                    
+                    catalog_docs = list(db.movies_catalog.find({
+                        "$or": [
+                            {"title": {"$in": all_titles_list}},
+                            {"original_title": {"$in": all_titles_list}},
+                            {"normalized_title": {"$in": normalized_titles_list}},
+                            {"normalized_original_title": {"$in": normalized_titles_list}}
+                        ]
+                    }))
+                    
+                    for d in catalog_docs:
+                        if d.get('title'): master_catalog_map[d.get('title')] = d
+                        if d.get('original_title'): master_catalog_map[d.get('original_title')] = d
+                        if d.get('normalized_title'): master_catalog_map[d.get('normalized_title')] = d
+                        if d.get('normalized_original_title'): master_catalog_map[d.get('normalized_original_title')] = d
+                        
+                    logger.info(f"   📚 Catalog Prefetch: Loaded {len(catalog_docs)} docs for {len(all_titles_set)} unique titles")
+                except Exception as e:
+                    logger.error(f"❌ Catalog prefetch error: {e}")
+
+            # Preparazione Bulk Writes
+            bulk_ops = []
+            
+            for row in chunk:
+                user_id = row.user_id
+                user_movies = movies_by_user.get(user_id, [])
+                
+                if not user_movies:
+                    bulk_ops.append(DeleteOne({"user_id": user_id}))
+                    continue
+                
+                try:
+                    # Calcola stats passando la mappa pre-caricata
+                    stats = compute_user_stats(user_movies, db.movies_catalog, prefetched_map=master_catalog_map)
+                    
+                    stats["user_id"] = user_id
+                    stats["updated_at"] = datetime.now(pytz.timezone('Europe/Rome')).isoformat()
+                    stats["source"] = "spark_streaming_bulk_v3"
+                    
+                    bulk_ops.append(UpdateOne(
+                        {"user_id": user_id},
+                        {"$set": stats},
+                        upsert=True
+                    ))
+                except Exception as e:
+                    logger.error(f"❌ Error computing stats for {user_id}: {e}")
+            
+            # Esegui Bulk Write per questo chunk
+            if bulk_ops:
+                try:
+                    db.user_stats.bulk_write(bulk_ops, ordered=False)
+                    logger.info(f"   ⚡ Processed batch chunk {len(bulk_ops)} users")
+                except Exception as e:
+                    logger.error(f"❌ Bulk write error: {e}")
+
+    except Exception as e:
+        logger.error(f"❌ Partition processing error: {e}")
+    finally:
+        client.close()
+        
+    return iter([])
+
+
+
 def process_batch(batch_df, batch_id):
     """
-    Processa un micro-batch di eventi e aggiorna le statistiche.
-    Chiamato ogni 30 secondi con gli eventi accumulati.
+    Processa un micro-batch.
+    Invece di collect(), usa foreachPartition per parallelismo reale.
     """
-    # --- GLOBAL TRENDS UPDATE (All Users) ---
-    # Run this every batch to ensure global stats are enriched and up-to-date,
-    # regardless of whether there are new user events.
-    try:
-        update_global_trends(spark_session=batch_df.sparkSession)
-    except Exception as e:
-        logger.error(f"❌ Errore aggiornamento trend globali: {e}")
+    # --- GLOBAL TRENDS UPDATE (Driver side - light) ---
+    # Throttling: Aggiorna solo se sono passati almeno 60 secondi
+    global last_trends_update
+    now = datetime.now()
+    if 'last_trends_update' not in globals() or (now - last_trends_update).total_seconds() > 60:
+        try:
+            update_global_trends(spark_session=batch_df.sparkSession)
+            last_trends_update = now
+        except Exception as e:
+            logger.error(f"❌ Errore aggiornamento trend globali: {e}")
 
     if batch_df.isEmpty():
-        logger.info(f"Batch {batch_id}: vuoto, skip events processing")
         return
     
-    logger.info(f"Batch {batch_id}: elaborazione {batch_df.count()} eventi")
+    logger.info(f"Batch {batch_id}: partizionamento e scrittura su Mongo...")
     
-    # Raggruppa per user_id
-    user_events = batch_df.groupBy("user_id").agg(
+    # Raggruppa per user_id (shuffle operation)
+    user_events_df = batch_df.groupBy("user_id").agg(
         collect_list(struct(
             col("event_type"),
             col("movie.name").alias("name"),
             col("movie.year").alias("year"),
-            col("movie.rating").alias("rating"),
-            col("movie.genres").alias("genres"),
-            col("movie.duration").alias("duration")
+            col("movie.rating").alias("rating")
         )).alias("events")
     )
     
-    # Per ogni utente, ricalcola le statistiche complete
-    # Questa è una versione semplificata - in produzione si farebbe incrementale
-    user_ids = [row.user_id for row in user_events.collect()]
+    # Parallel Write: Esegue process_partition in parallelo sui worker
+    user_events_df.foreachPartition(process_partition)
     
-    from pymongo import MongoClient
-    client = MongoClient(MONGODB_URL)
-    db = client.cinematch_db
-    
-    for user_id in user_ids:
-        try:
-            # Leggi tutti i film dell'utente da MongoDB
-            user_movies = list(db.movies.find({"user_id": user_id}))
-            
-            if not user_movies:
-                # Utente senza film, rimuovi stats
-                db.user_stats.delete_one({"user_id": user_id})
-                continue
-            
-            # Calcola statistiche
-            stats = compute_user_stats(user_movies, db.movies_catalog)
-            stats["user_id"] = user_id
-            stats["updated_at"] = datetime.now(pytz.timezone('Europe/Rome')).isoformat()
-            stats["source"] = "spark_streaming"
-            
-            # Salva/aggiorna direttamente nella collection di produzione
-            db.user_stats.update_one(
-                {"user_id": user_id},
-                {"$set": stats},
-                upsert=True
-            )
-            
-            logger.info(f"✅ Stats aggiornate per user {user_id}: {stats.get('total_watched', 0)} film")
-            
-        except Exception as e:
-            logger.error(f"❌ Errore elaborazione user {user_id}: {e}")
-            
+    logger.info(f"✅ Batch {batch_id} completato.")
 
-    
-    client.close()
 
 
 def update_global_trends(spark_session):
@@ -301,12 +389,10 @@ def update_global_trends(spark_session):
 
 
 
-def compute_user_stats(movies, catalog_collection):
+def compute_user_stats(movies, catalog_collection, prefetched_map=None):
     """
     Calcola le statistiche complete per un utente partendo dalla lista dei suoi film.
-    - Il grafico a torta dei generi è relativo a TUTTI i film visti dell'utente.
-    - I dati dei film recuperano tutto (poster, url, etc.) dal database movie_catalog.
-    - Directors e attori sono calcolati su TUTTI i film.
+    - prefetched_map: Opzionale. Se fornito, evita query al DB.
     """
     from collections import Counter
     import re
@@ -325,7 +411,12 @@ def compute_user_stats(movies, catalog_collection):
     
     # Build Catalog Map
     catalog_map = {}
-    if movie_titles:
+    
+    if prefetched_map:
+        # USA LA MAPPA FORNITA (OTTIMIZZAZIONE)
+        catalog_map = prefetched_map
+    elif movie_titles:
+        # FALLBACK: Query DB (Vecchio metodo lento)
         try:
             # Query catalog for all these titles and their normalized variants
             normalized_titles = [normalize_title(t) for t in movie_titles]
@@ -554,8 +645,10 @@ def compute_user_stats(movies, catalog_collection):
             return round(sum(valid_ratings) / len(valid_ratings), 1)
         return 0
     
-    # 8. Best Rated Directors (Best Avg Rating, min 1 movie)
-    # Restituisci TUTTI i registi con rating per permettere il filtraggio frontend
+    # 8. Best Rated Directors & Most Watched Directors
+    # Ottimizzazione: Calcola Top 10 per soglie specifiche (1, 2, 3, 5 film)
+    # invece di inviare l'intera lista al frontend.
+    
     director_stats_list = []
     for d, ratings_list in director_ratings.items():
         valid_ratings = [r for r in ratings_list if r is not None]
@@ -563,12 +656,19 @@ def compute_user_stats(movies, catalog_collection):
             avg = round(sum(valid_ratings) / len(valid_ratings), 1)
             director_stats_list.append({"name": d, "count": len(valid_ratings), "avg_rating": avg})
             
-    # Sort by rating (desc), then count (desc)
-    director_stats_list.sort(key=lambda x: (x["avg_rating"], x["count"]), reverse=True)
-    best_rated_directors = director_stats_list  # Tutti per permettere filtraggio 1+, 2+, 3+, 5+
+    # Most Watched (Top 15 per count)
+    director_stats_list.sort(key=lambda x: x["count"], reverse=True)
+    most_watched_directors = director_stats_list[:15]
     
-    # 9. Best Rated Actors (Best Avg Rating, min 1 movie)
-    # Restituisci TUTTI gli attori con rating per permettere il filtraggio frontend
+    # Best Rated (Top 10 per soglie)
+    best_rated_directors = {}
+    for threshold in [1, 2, 3, 5]:
+        filtered = [d for d in director_stats_list if d["count"] >= threshold]
+        # Sort by rating (desc), then count (desc)
+        filtered.sort(key=lambda x: (x["avg_rating"], x["count"]), reverse=True)
+        best_rated_directors[str(threshold)] = filtered[:10]
+
+    # 9. Best Rated Actors & Most Watched Actors
     actor_stats_list = []
     for a, ratings_list in actor_ratings.items():
         valid_ratings = [r for r in ratings_list if r is not None]
@@ -576,8 +676,16 @@ def compute_user_stats(movies, catalog_collection):
             avg = round(sum(valid_ratings) / len(valid_ratings), 1)
             actor_stats_list.append({"name": a, "count": len(valid_ratings), "avg_rating": avg})
             
-    actor_stats_list.sort(key=lambda x: (x["avg_rating"], x["count"]), reverse=True)
-    best_rated_actors = actor_stats_list  # Tutti per permettere filtraggio 1+, 2+, 3+, 5+
+    # Most Watched (Top 15 per count)
+    actor_stats_list.sort(key=lambda x: x["count"], reverse=True)
+    most_watched_actors = actor_stats_list[:15]
+    
+    # Best Rated (Top 10 per soglie)
+    best_rated_actors = {}
+    for threshold in [1, 2, 3, 5]:
+        filtered = [a for a in actor_stats_list if a["count"] >= threshold]
+        filtered.sort(key=lambda x: (x["avg_rating"], x["count"]), reverse=True)
+        best_rated_actors[str(threshold)] = filtered[:10]
 
     return {
         "total_watched": len(movies),  # TUTTI i film dell'utente
@@ -593,8 +701,10 @@ def compute_user_stats(movies, catalog_collection):
         "watch_time_hours": total_duration // 60,
         "avg_duration": round(total_duration / duration_count) if duration_count > 0 else 0,
         "best_rated_directors": best_rated_directors,
+        "most_watched_directors": most_watched_directors,
         "best_rated_actors": best_rated_actors,
-        "stats_version": "3.1"  # Schema ottimizzato - rimossi campi ridondanti
+        "most_watched_actors": most_watched_actors,
+        "stats_version": "3.2"  # Schema ottimizzato - top lists strutturate
     }
 
 
@@ -626,7 +736,7 @@ def main():
     query = parsed_stream.writeStream \
         .foreachBatch(process_batch) \
         .outputMode("update") \
-        .trigger(processingTime="5 seconds") \
+        .trigger(processingTime="1 second") \
         .start()
     
     logger.info("✅ Streaming avviato. In attesa di eventi...")

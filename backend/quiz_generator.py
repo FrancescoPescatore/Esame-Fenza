@@ -350,17 +350,54 @@ def save_questions_to_db(questions: List[Dict]) -> int:
             
     return saved_count
 
-async def run_daily_quiz_generation():
+async def run_daily_quiz_generation(force: bool = False):
     """Main task per produzione."""
     ensure_indexes()
     italy_tz = pytz.timezone('Europe/Rome')
     today_str = datetime.now(italy_tz).strftime("%Y-%m-%d")
     
-    # Check if already generating (prevent concurrent runs)
+    logger.info(f"🔍 [Quiz] run_daily_quiz_generation called. force={force}, today={today_str}")
+    
+    # Check status
     current_status = db.quiz_status.find_one({"_id": "daily_generation"})
-    if current_status and current_status.get("status") == "GENERATING":
-        logger.warning("⚠️ Quiz generation already in progress, skipping...")
-        return
+    
+    if current_status:
+        # 1. Check if already finished today
+        if not force and current_status.get("last_generated_date") == today_str and current_status.get("status") == "FINISHED":
+            logger.info(f"✅ [Quiz] Quiz already generated for {today_str}, skipping.")
+            return
+
+        # 2. Check if currently generating
+        if current_status.get("status") == "GENERATING":
+             # EXTRA CHECK: If we already have 5 questions for today, just mark as FINISHED
+            existing_count = quiz_questions.count_documents({"quiz_date": today_str})
+            if existing_count >= 5:
+                logger.info(f"✅ [Quiz] Found {existing_count} questions despite GENERATING status. Marking as FINISHED.")
+                db.quiz_status.update_one(
+                    {"_id": "daily_generation"},
+                    {
+                        "$set": {
+                            "status": "FINISHED",
+                            "last_generated_date": today_str,
+                            "questions_generated": existing_count,
+                            "finished_at": datetime.now(italy_tz).isoformat()
+                        }
+                    },
+                    upsert=True
+                )
+                return
+
+            # Check for stale lock (older than 30 mins)
+            started_at_str = current_status.get("started_at", "")
+            try:
+                started_at = datetime.fromisoformat(started_at_str)
+                if (datetime.now(italy_tz) - started_at).total_seconds() > 1800:
+                    logger.warning("⚠️ Stale generation lock detected (>30m), resetting...")
+                else:
+                    logger.warning("⚠️ Quiz generation already in progress, skipping...")
+                    return
+            except:
+                pass
     
     # 1. Update status to GENERATING
     try:
@@ -391,9 +428,10 @@ async def run_daily_quiz_generation():
             },
             upsert=True
         )
+        logger.info(f"✅ Quiz generation completed: {saved_count} questions.")
         
     except Exception as e:
-        print(f"Error during quiz generation: {e}")
+        logger.error(f"Error during quiz generation: {e}")
         # Set status to ERROR so frontend knows something went wrong
         db.quiz_status.update_one(
             {"_id": "daily_generation"},
@@ -442,64 +480,13 @@ def get_questions_count() -> int:
     return quiz_questions.count_documents({})
 
 if __name__ == "__main__":
-    import time
-    
+    # Test wrapper that uses the same logic as production
     async def test():
-        ensure_indexes()
         print(f"\n{'='*70}")
-        print(f"  🎬 QUIZ GENERATOR - QWEN 2.5 7B (IL MIGLIORE)")
+        print(f"  🎬 QUIZ GENERATOR - TEST RUN")
         print(f"{'='*70}")
-        print(f"  Model: {OLLAMA_MODEL}")
-        print(f"  Validation: ✓ Rigorosa")
-        print(f"  Retry: ✓ Max 3 tentativi")
-        print(f"  Target: Qualità 9/10+")
-        print(f"{'='*70}\n")
         
-        n = 5
-        movies = get_random_movies(n * 2)
+        # Use force=True to ensure we can test even if already generated today
+        await run_daily_quiz_generation(force=True)
         
-        start_time = time.time()
-        generated_questions = []
-        failed = 0
-        
-        for i, movie in enumerate(movies):
-            if len(generated_questions) >= n:
-                break
-                
-            print(f"\n[{i+1}/{n}] {movie.get('title')} ({movie.get('year')})")
-            q_start = time.time()
-            
-            q = await generate_quiz_question(movie)
-            q_time = time.time() - q_start
-            
-            if q:
-                generated_questions.append(q)
-                
-                # Salva immediatamente nel DB per sicurezza
-                save_questions_to_db([q])
-                
-                print(f"  ✅ Generated & Saved in {q_time:.2f}s")
-                print(f"     Q: {q['question'][:65]}...")
-                print(f"     Diff: {q['difficulty']}")
-                print(f"     ✓: {next(a['text'] for a in q['answers'] if a['isCorrect'])[:50]}...")
-            else:
-                failed += 1
-                print(f"  ❌ Failed after {q_time:.2f}s")
-
-        total_time = time.time() - start_time
-        
-        print(f"\n{'='*70}")
-        if generated_questions:
-            success_rate = len(generated_questions) / (len(generated_questions) + failed) * 100
-            print(f"  ✅ SUCCESS: {len(generated_questions)}/{n} questions generated & saved")
-            print(f"  ⏱️  Total: {total_time:.2f}s")
-            print(f"  📊 Average: {total_time/len(generated_questions):.2f}s per question")
-            print(f"  ✓  Success rate: {success_rate:.0f}%")
-        else:
-            print(f"  ❌ FAILED: No valid questions generated")
-            print(f"  ⏱️  Time: {total_time:.2f}s")
-        
-        print(f"  💾 Saved to: MongoDB (quiz_questions)")
-        print(f"{'='*70}\n")
-            
     asyncio.run(test())

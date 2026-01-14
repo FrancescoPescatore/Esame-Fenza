@@ -22,8 +22,7 @@ from pydantic import BaseModel
 from typing import Optional, List, Dict
 from auth import get_password_hash, verify_password, create_access_token, get_current_user_id
 from quiz_generator import get_daily_questions, run_daily_quiz_generation
-from scrape_comingsoon import run_scraper
-from cinema_film_sync import sync_films_to_catalog
+from cinema_pipeline import run_full_pipeline
 from kafka_producer import get_kafka_producer
 
 # ============================================
@@ -208,54 +207,27 @@ async def startup_event():
     scheduler.add_job(scheduled_movie_updater, 'cron', hour=1, minute=0, timezone=italy_tz, id='movie_updater')
     
     # --- SCHEDULER CINEMA CAMPANIA ---
-    from scrape_comingsoon import run_scraper as run_cinema_scraper
-    from cinema_film_sync import sync_films_to_catalog
+    from cinema_pipeline import run_full_pipeline
     
-    def run_cinema_sync_with_lock():
-        """Esegue il sync con lock anti-duplicazione."""
+    def scheduled_cinema_pipeline():
+        """Esegue il pipeline completo cinema (scrape + sync) con lock anti-duplicazione."""
         italy_tz = pytz.timezone('Europe/Rome')
-        status = db["scraper_progress"].find_one({"_id": "cinema_sync"})
-        is_running = status and status.get("status") == "running"
-        if is_running:
-            print("⏭️ [CinemaSync] Già in esecuzione, salto.")
-            return
-        try:
-            db["scraper_progress"].update_one(
-                {"_id": "cinema_sync"},
-                {"$set": {"status": "running", "updated_at": datetime.now(italy_tz).isoformat()}},
-                upsert=True
-            )
-            print("🔄 [Cinema] Avvio sync al catalogo...")
-            sync_films_to_catalog()
-            print("✅ [Cinema] Sync completato.")
-        except Exception as e:
-            print(f"❌ [Cinema] Errore sync: {e}")
-        finally:
-            db["scraper_progress"].update_one(
-                {"_id": "cinema_sync"},
-                {"$set": {"status": "idle", "updated_at": datetime.now(italy_tz).isoformat()}}
-            )
-    
-    def scheduled_cinema_scraper():
-        """Wrapper per lo scheduler che esegue scraper + sync in sequenza."""
         scraper_status = db["scraper_progress"].find_one({"_id": "cinema_scraper"})
         is_running = scraper_status and scraper_status.get("status") in ["scraping", "starting", "saving"]
         if is_running:
-            print("⏭️ [Scheduler] Scraper già in esecuzione, salto questa esecuzione programmata.")
+            print("⏭️ [Scheduler] Pipeline già in esecuzione, salto.")
             return
         
-        print("🕐 [Scheduler] Avvio scraper programmato a mezzanotte...")
+        print("🕐 [Scheduler] Avvio cinema pipeline a mezzanotte...")
         try:
-            run_cinema_scraper()
-            # Dopo lo scraper, esegui sempre il sync
-            print("🔗 [Scheduler] Scraper completato, avvio sync...")
-            run_cinema_sync_with_lock()
+            run_full_pipeline()  # Esegue FASE 1 (scrape) + FASE 2 (sync) automaticamente
+            print("✅ [Scheduler] Cinema pipeline completato.")
         except Exception as e:
-            print(f"❌ [Scheduler] Errore durante scraper/sync: {e}")
+            print(f"❌ [Scheduler] Errore durante pipeline: {e}")
     
-    # Scraper + Sync alle 00:00 (mezzanotte) ora italiana - concatenati
+    # Cinema Pipeline alle 00:00 (mezzanotte) ora italiana
     italy_tz = pytz.timezone('Europe/Rome')
-    scheduler.add_job(scheduled_cinema_scraper, 'cron', hour=0, minute=0, timezone=italy_tz, id='cinema_scraper_and_sync')
+    scheduler.add_job(scheduled_cinema_pipeline, 'cron', hour=0, minute=0, timezone=italy_tz, id='cinema_pipeline')
     
     # Quiz AI generation alle 03:00 (ogni notte)
     def scheduled_quiz_generation():
@@ -273,7 +245,7 @@ async def startup_event():
     scheduler.add_job(scheduled_quiz_generation, 'cron', hour=2, minute=50, timezone=italy_tz, id='quiz_generation')
     
     scheduler.start()
-    print("🕒 Scheduler avviato: Movie Updater alle 01:00 + Cinema Scraper+Sync a mezzanotte + Quiz AI alle 02:50 (ora italiana).")
+    print("🕒 Scheduler avviato: Movie Updater alle 01:00 + Cinema Pipeline a mezzanotte + Quiz AI alle 02:50 (ora italiana).")
     
     # Eseguiamo anche un update SUBITO all'avvio in background (con lock)
     import threading
@@ -310,8 +282,8 @@ async def startup_event():
         
         if last_run_date != today_date:
             print(f"⚠️ [Startup] Dati cinema vecchi (Last: '{last_run_date}' vs Today: '{today_date}').")
-            print("🚀 [Startup] Avvio automatico Scraper + Sync in background...")
-            t_scraper = threading.Thread(target=scheduled_cinema_scraper)
+            print("🚀 [Startup] Avvio automatico Cinema Pipeline in background...")
+            t_scraper = threading.Thread(target=scheduled_cinema_pipeline)
             t_scraper.start()
         else:
             print("✅ [Startup] Dati cinema già aggiornati a oggi.")
@@ -610,28 +582,14 @@ async def get_cinema_dates(current_user_id: str = Depends(get_current_user_id)):
 @app.post("/cinema/refresh")
 async def refresh_cinema_data(background_tasks: BackgroundTasks, province: str = "napoli"):
     """
-    Avvia manualmente lo scraping e la sincronizzazione dei film al cinema.
-    Esegue in background: Scrape -> Sync.
+    Avvia manualmente il cinema pipeline (scrape + sync) in background.
     """
     async def run_refresh_task(prov_slug: str):
         try:
-            # Stats tracker
-            status_collection = db["scraper_progress"]
-            
-            # 1. Scrape
-            print(f"🔄 [Manual Refresh] Scraper started for {prov_slug}...")
-            # Note: run_scraper currently scrapes ALL provinces in CAMPANIA_PROVINCES
-            # We can update run_scraper to accept a province list if needed, 
-            # but for now running fully is safer to ensure consistency.
-            # Running in threadpool to avoid blocking event loop
-            await run_in_threadpool(run_scraper)
-            
-            # 2. Sync
-            print(f"🔄 [Manual Refresh] Sync started...")
-            await run_in_threadpool(sync_films_to_catalog)
-            
-            print(f"✅ [Manual Refresh] Completed.")
-            
+            from cinema_pipeline import run_full_pipeline
+            print(f"🔄 [Manual Refresh] Cinema pipeline started...")
+            await run_in_threadpool(run_full_pipeline)
+            print(f"✅ [Manual Refresh] Cinema pipeline completed.")
         except Exception as e:
             print(f"❌ [Manual Refresh] Error: {e}")
 
@@ -639,7 +597,7 @@ async def refresh_cinema_data(background_tasks: BackgroundTasks, province: str =
     
     return {
         "status": "refreshing",
-        "message": "Aggiornamento dati cinema avviato in background"
+        "message": "Cinema pipeline avviato in background"
     }
 
 @app.get("/cinema/status")
@@ -712,17 +670,15 @@ async def get_cinema_films(
             
             # If data is from before today AND scraper is not already running, trigger a background rescrape
             if last_update_date.replace(tzinfo=None) < today and not is_scraper_running:
-                print(f"📅 [Cinema] Dati obsoleti ({last_update_date.date()} < {today.date()}), avvio scrape in background...")
-                from scrape_comingsoon import run_scraper as run_cinema_scraper
-                from cinema_film_sync import sync_films_to_catalog
+                print(f"📅 [Cinema] Dati obsoleti ({last_update_date.date()} < {today.date()}), avvio pipeline in background...")
+                from cinema_pipeline import run_full_pipeline
                 
                 def refresh_cinema_data():
                     try:
-                        run_cinema_scraper()
-                        sync_films_to_catalog()
-                        print("✅ [Cinema] Scrape completato in background.")
+                        run_full_pipeline()
+                        print("✅ [Cinema] Pipeline completato in background.")
                     except Exception as e:
-                        print(f"❌ [Cinema] Errore durante lo scrape: {e}")
+                        print(f"❌ [Cinema] Errore durante il pipeline: {e}")
                 
                 background_tasks.add_task(refresh_cinema_data)
                 is_refreshing = True
@@ -732,18 +688,16 @@ async def get_cinema_films(
         except Exception as e:
             print(f"⚠️ Errore parsing updated_at: {e}")
     else:
-        # No showtimes at all, trigger scrape
-        print("📅 [Cinema] Nessun dato presente, avvio scrape in background...")
-        from scrape_comingsoon import run_scraper as run_cinema_scraper
-        from cinema_film_sync import sync_films_to_catalog
+        # No showtimes at all, trigger pipeline
+        print("📅 [Cinema] Nessun dato presente, avvio pipeline in background...")
+        from cinema_pipeline import run_full_pipeline
         
         def refresh_cinema_data():
             try:
-                run_cinema_scraper()
-                sync_films_to_catalog()
-                print("✅ [Cinema] Scrape completato in background.")
+                run_full_pipeline()
+                print("✅ [Cinema] Pipeline completato in background.")
             except Exception as e:
-                print(f"❌ [Cinema] Errore durante lo scrape: {e}")
+                print(f"❌ [Cinema] Errore durante il pipeline: {e}")
         
         background_tasks.add_task(refresh_cinema_data)
         is_refreshing = True
@@ -2358,8 +2312,8 @@ async def generate_quiz_questions(background_tasks: BackgroundTasks, n: int = 5)
     """
     async def generate_task():
         try:
-            from quiz_generator import run_daily_quiz_generation
-            await run_daily_quiz_generation()
+            from quiz_generator import run_daily_quiz_generation_v2
+            await run_daily_quiz_generation_v2()
         except Exception as e:
             print(f"❌ Errore generazione quiz: {e}")
     
