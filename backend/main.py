@@ -2177,6 +2177,108 @@ async def get_catalog_genres():
     return {"genres": [{"name": g["_id"], "count": g["count"]} for g in genres]}
 
 
+
+# ============================================
+# ELASTICSEARCH CONFIGURATION
+# ============================================
+from elasticsearch import Elasticsearch
+
+ES_URL = os.getenv("ELASTICSEARCH_URL", "http://elasticsearch:9200")
+ES_INDEX_NAME = "movies"
+es_client = Elasticsearch(ES_URL)
+
+try:
+    if not es_client.ping():
+        print(f"⚠️ Cannot connect to Elasticsearch at {ES_URL}")
+except Exception as e:
+    print(f"⚠️ Elasticsearch connection error: {e}")
+
+
+class AdvancedSearchRequest(BaseModel):
+    query: str
+    fields: List[str] = ["title", "original_title", "actors", "director", "genres", "description"]
+
+
+@app.post("/catalog/advanced-search")
+async def advanced_search_catalog(req: AdvancedSearchRequest):
+    """
+    Ricerca avanzata film nel catalogo usando Elasticsearch.
+    Permette di specificare i campi su cui cercare.
+    """
+    if not req.query:
+        return {"results": [], "query": req.query, "total": 0}
+
+    # Costruisci la query ElasticSearch
+    es_query = {
+        "size": 20,
+        "query": {
+            "multi_match": {
+                "query": req.query,
+                "type": "best_fields",
+                "fields": req.fields,
+                "fuzziness": "AUTO"
+            }
+        }
+    }
+
+    try:
+        response = es_client.search(
+            index=ES_INDEX_NAME,
+            body=es_query
+        )
+        
+        hits = response["hits"]["hits"]
+        results = []
+        
+        # Collect Titles to fetch posters from Mongo (more reliable than IDs across different imports)
+        titles = [hit["_source"].get("title") for hit in hits if hit["_source"].get("title")]
+        
+        # Fetch posters mapping
+        posters_map = {}
+        if titles:
+            cursor = movies_catalog.find(
+                {"title": {"$in": titles}},
+                {"title": 1, "poster_url": 1}
+            )
+            for doc in cursor:
+                posters_map[doc["title"]] = doc.get("poster_url")
+
+        for hit in hits:
+            src = hit["_source"]
+            title = src.get("title")
+            
+            # Use fetched poster or fallback
+            poster = posters_map.get(title) or STOCK_POSTER_URL
+            
+            # Mappa il risultato ES nel formato CatalogMovie
+            movie = {
+                 "imdb_id": src.get("imdb_title_id") or src.get("mongo_id"), 
+                 "title": src.get("title"),
+                 "original_title": src.get("original_title"),
+                 "year": src.get("year"),
+                 "genres": src.get("genres", []),
+                 "poster_url": poster, 
+                 "avg_vote": src.get("avg_vote"),
+                 "description": src.get("description"),
+                 "director": ", ".join(src.get("director", [])),
+                 "actors": ", ".join(src.get("actors", [])),
+                 "score": hit["_score"]
+            }
+            results.append(movie)
+
+        return {
+            "results": results, 
+            "query": req.query, 
+            "total": response["hits"]["total"]["value"]
+        }
+
+    except Exception as e:
+        print(f"❌ ES Search Error: {e}")
+        # Fallback alla ricerca MongoDB standard se ES fallisce
+        print("⚠️ Fallback to MongoDB search...")
+        return await search_catalog(req.query, limit=20)
+
+
 @app.get("/catalog/poster/{imdb_id}")
 async def get_movie_poster(imdb_id: str):
     """Ottiene solo l'URL del poster per un film."""

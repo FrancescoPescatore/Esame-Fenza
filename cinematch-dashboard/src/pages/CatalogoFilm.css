@@ -75,9 +75,53 @@
     transition: all var(--transition-fast);
 }
 
+
 .clear-search:hover {
     background: var(--accent-primary);
     color: #000;
+}
+
+/* Advanced Filters */
+.advanced-filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-top: 1rem;
+    align-items: center;
+}
+
+.filter-label-text {
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+    margin-right: 0.5rem;
+}
+
+.filter-chip {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.4rem 0.8rem;
+    border-radius: 20px;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 0.9rem;
+    transition: all 0.2s ease;
+}
+
+.filter-chip:hover {
+    background: rgba(255, 255, 255, 0.1);
+}
+
+.filter-chip.active {
+    background: rgba(229, 9, 20, 0.2);
+    border-color: var(--accent-primary);
+    color: var(--accent-primary);
+}
+
+.filter-chip input {
+    display: none;
 }
 
 /* Search Results */
