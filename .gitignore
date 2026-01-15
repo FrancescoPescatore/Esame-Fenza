@@ -17,3 +17,6 @@ venv/
 # Docker/DB
 mongo_data/
 .DS_Store
+
+# Faiss indexes
+backend/data/faiss_bge*
