@@ -1914,9 +1914,22 @@ async def remove_movie_from_collection(
         {"user_id": current_user_id},
         {
             "$inc": {"movies_count": -1},
-            "$set": {"last_interaction": datetime.now(italy_tz).isoformat()}
+            "$set": {
+                "last_interaction": datetime.now(italy_tz).isoformat(),
+                "data_updated_at": datetime.now(italy_tz).isoformat()
+            }
         }
     )
+    
+    # Triggera ricalcolo statistiche via Spark
+    # Recupera tutti i film rimanenti per inviare evento completo
+    all_movies = list(movies_collection.find({"user_id": current_user_id}))
+    
+    try:
+        # kafka_producer è già istanziato sopra
+        kafka_producer.send_batch_event("RECALCULATE", current_user_id, all_movies)
+    except Exception as e:
+        print(f"⚠️ Errore invio Kafka: {e}")
     
     # Stats aggiornate via Kafka/Spark
     return {"message": "Film rimosso con successo"}
