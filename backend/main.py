@@ -1330,78 +1330,102 @@ async def get_movies(current_user_id: str = Depends(get_current_user_id)):
 
 @app.get("/movies/person")
 async def get_movies_by_person(name: str, type: str, current_user_id: str = Depends(get_current_user_id)):
-    """Ottiene i film dell'utente filtrati per regista o attore."""
-    from collections import defaultdict # Import necessario
-    
-    user_movies = list(movies_collection.find({"user_id": current_user_id}))
-    titles = [m.get('name') for m in user_movies]
-    
+    """
+    Ottiene i film dell'utente filtrati per regista o attore.
+    V2: Refactoring per allineamento totale con Spark.
+    Invece di cercare il regista nel catalogo e poi matchare i film utente,
+    facciamo come Spark: prendiamo i film utente, li arricchiamo TUTTI col catalogo,
+    e filtriamo quelli che hanno il regista/attore cercato.
+    """
     import re
+    
+    # 1. Recupera TUTTI i film utente
+    user_movies = list(movies_collection.find({"user_id": current_user_id}))
+    if not user_movies:
+        return []
+
+    # 2. Batch Lookup Keys
+    titles_to_search = set()
+    norm_titles_to_search = set()
+    
+    for m in user_movies:
+        t = m.get('name')
+        if t:
+            titles_to_search.add(t)
+            norm_titles_to_search.add(normalize_title(t))
+            
+    # 3. Fetch Catalog (Enrichment Source)
+    # Cerchiamo nel catalogo qualsiasi film che l'utente possiede
+    catalog_docs = list(movies_catalog.find({
+        "$or": [
+            {"title": {"$in": list(titles_to_search)}},
+            {"original_title": {"$in": list(titles_to_search)}},
+            {"normalized_title": {"$in": list(norm_titles_to_search)}},
+            {"normalized_original_title": {"$in": list(norm_titles_to_search)}}
+        ]
+    }).collation({"locale": "en", "strength": 2}))
+    
+    # 4. Build Catalog Map (Key = Normalized Title -> Doc)
+    catalog_map = {}
+    for cd in catalog_docs:
+        # Mappa per tutte le varianti di titolo per garantire il match
+        if cd.get('title'): 
+            catalog_map[normalize_title(cd['title'])] = cd
+        if cd.get('original_title'): 
+            catalog_map[normalize_title(cd['original_title'])] = cd
+        if cd.get('normalized_title'): 
+            catalog_map[cd['normalized_title']] = cd
+        if cd.get('normalized_original_title'): 
+            catalog_map[cd['normalized_original_title']] = cd
+            
+    # 5. Enrich & Filter
+    results = []
+    target_name_norm = normalize_title(name)
     field = "director" if type == "director" else "actors"
     
-    # Cerchiamo nel catalogo tutti i film di quella persona
-    catalog_matches = list(movies_catalog.find({
-        field: {"$regex": re.escape(name), "$options": "i"}
-    }, {"title": 1, "original_title": 1, "genres": 1, "poster_url": 1, "poster_path": 1, "year": 1, "avg_vote": 1, "director": 1, "actors": 1, "description": 1, "duration": 1}))
-    
-    # Mappa: titolo -> Lista di candidati (per gestire collisioni)
-    catalog_map = defaultdict(list)
-    for cm in catalog_matches:
-        if cm.get('title'): catalog_map[cm['title'].lower()].append(cm)
-        if cm.get('original_title'): catalog_map[cm['original_title'].lower()].append(cm)
-        
-    results = []
     for m in user_movies:
-        title = m.get('name', '').lower()
-        year = m.get('year')
+        # Enrich logic
+        title_norm = normalize_title(m.get('name', ''))
+        cat_match = catalog_map.get(title_norm)
         
-        candidates = catalog_map.get(title)
-        if candidates:
-            # Trova il miglior candidato
-            match = None
+        # Determine person list
+        people_str = ""
+        cat_info = {}
+        
+        if cat_match:
+            cat_info = cat_match
+            people_str = cat_match.get(field, "")
+        else:
+            # Fallback (raro se non c'è match, ma usiamo dati utente se presenti)
+            cat_info = {}
+            people_str = m.get(field, "") # Normalmente vuoto nei film user
             
-            # 1. Anno esatto
-            if year:
-                for cand in candidates:
-                    if cand.get('year') == year:
-                        match = cand
-                        break
+        # Check Match
+        if not people_str:
+            continue
             
-            # 2. Anno tolleranza +/- 1
-            if not match and year:
-                for cand in candidates:
-                    if cand.get('year') and isinstance(cand['year'], int) and abs(cand['year'] - year) <= 1:
-                        match = cand
-                        break
-                        
-            # 3. Se non c'è anno nel film utente o nessuna corrispondenza trovata, 
-            # MA il titolo corrisponde a un film di questo attore...
-            # Qui bisogna stare attenti. Se l'utente ha "Passengers" (2016) e l'attore è Anne Hathaway (Passengers 2008), 
-            # NON dovremmo matchare se l'anno è diverso! 
-            
-            # Se abbiamo trovato un match di anno, bene.
-            # Se NON abbiamo trovato match di anno, e l'anno era specificato, scartiamo (è un omonimo sbagliato).
-            if match:
-                cat_info = match
-            elif year is None:
-                 # Se l'utente non ha messo l'anno, assumiamo sia quello giusto (fallback)
-                 cat_info = candidates[0]
-            else:
-                # Anno specificato ma diverso -> Omonimo, non aggiungere.
-                continue
-
-            # Priorità al poster_url (stessa logica del catalogo), poi poster_path TMDB
-            
-            # Priorità al poster_url (stessa logica del catalogo), poi poster_path TMDB
+        # Split tokens (spark logic: split by comma or pipe)
+        people_list = [p.strip() for p in re.split(r'[,|]', str(people_str)) if p.strip()]
+        
+        is_match = False
+        for p in people_list:
+            if normalize_title(p) == target_name_norm:
+                is_match = True
+                break
+                
+        if is_match:
+            # Poster construction
             poster = cat_info.get('poster_url')
             if not poster and cat_info.get('poster_path'):
                 poster = f"https://image.tmdb.org/t/p/w500{cat_info['poster_path']}"
-            
+            if not poster:
+                poster = m.get('poster_url') or STOCK_POSTER_URL
+                
             results.append({
                 "id": str(m.get('_id', random.randint(1, 100000))),
                 "title": m.get('name'),
                 "year": m.get('year') or cat_info.get('year'),
-                "poster": poster or STOCK_POSTER_URL,
+                "poster": poster,
                 "rating": m.get('rating', 0),
                 "genres": cat_info.get('genres', []),
                 "director": cat_info.get('director', ''),
