@@ -1204,13 +1204,13 @@ async def get_user_stats(current_user_id: str = Depends(get_current_user_id)):
     # 4. Sync Status Check
     # Default to "synced" - only show "syncing" if there's an explicit pending update
     sync_status = "synced"
-    user = users_collection.find_one({"user_id": current_user_id}, {"last_interaction": 1})
+    user = users_collection.find_one({"user_id": current_user_id}, {"data_updated_at": 1})
     stats_updated = stats.get("updated_at")
     
-    if user and user.get("last_interaction") and stats_updated:
+    if user and user.get("data_updated_at") and stats_updated:
         # Both timestamps exist - compare them
-        last_interaction = user.get("last_interaction")
-        if last_interaction > stats_updated:
+        data_updated = user.get("data_updated_at")
+        if data_updated > stats_updated:
             sync_status = "syncing"
     
     stats["sync_status"] = sync_status
@@ -1301,8 +1301,7 @@ async def add_movie(movie: MovieCreate, background_tasks: BackgroundTasks, curre
         {"user_id": current_user_id},
         {"$set": {
             "has_data": True,
-            "data_updated_at": datetime.now(italy_tz).isoformat(),
-            "last_interaction": datetime.now(italy_tz).isoformat()
+            "data_updated_at": datetime.now(italy_tz).isoformat()
         }}
     )
     
@@ -1821,9 +1820,19 @@ async def add_movie_to_collection(
             }}
         )
         
-        # Evento Kafka per stats update
-        kafka_producer = get_kafka_producer()
-        kafka_producer.send_movie_event("UPDATE", current_user_id, {"name": movie.name, "year": movie.year, "rating": movie.rating})
+        # Aggiorna timestamp per invalidare cache e triggerare ricalcolo
+        users_collection.update_one(
+            {"user_id": current_user_id},
+            {"$set": {"data_updated_at": datetime.now(italy_tz).isoformat()}}
+        )
+        
+        # Triggera ricalcolo statistiche via Spark con batch RECALCULATE
+        all_movies = list(movies_collection.find({"user_id": current_user_id}))
+        try:
+            kafka_producer = get_kafka_producer()
+            kafka_producer.send_batch_event("RECALCULATE", current_user_id, all_movies)
+        except Exception as e:
+            print(f"⚠️ Errore invio Kafka: {e}")
         
         return {"status": "success", "message": "Film aggiornato"}
     
@@ -1854,8 +1863,7 @@ async def add_movie_to_collection(
             "$inc": {"movies_count": 1}, 
             "$set": {
                 "has_data": True,
-                "last_interaction": datetime.now(italy_tz).isoformat(),
-                "data_updated_at": datetime.now(italy_tz).isoformat()  # Per invalidare cache raccomandazioni
+                "data_updated_at": datetime.now(italy_tz).isoformat()
             }
         }
     )
@@ -1883,17 +1891,19 @@ async def update_user_movie(
     if res.matched_count == 0:
         raise HTTPException(status_code=404, detail="Film non trovato nei tuoi visti")
     
-    # Pubblica evento Kafka per elaborazione Spark
-    kafka_producer = get_kafka_producer()
-    kafka_producer.send_movie_event("UPDATE", current_user_id, {
-        "name": req.name, "year": req.year, "rating": req.rating
-    })
-    
-    # Aggiorna timestamp interazione per sync UI
+    # Aggiorna timestamp per invalidare cache e triggerare ricalcolo
     users_collection.update_one(
         {"user_id": current_user_id},
-        {"$set": {"last_interaction": datetime.now(italy_tz).isoformat()}}
+        {"$set": {"data_updated_at": datetime.now(italy_tz).isoformat()}}
     )
+    
+    # Triggera ricalcolo statistiche via Spark con batch RECALCULATE
+    all_movies = list(movies_collection.find({"user_id": current_user_id}))
+    try:
+        kafka_producer = get_kafka_producer()
+        kafka_producer.send_batch_event("RECALCULATE", current_user_id, all_movies)
+    except Exception as e:
+        print(f"⚠️ Errore invio Kafka: {e}")
     
     # Stats aggiornate via Kafka/Spark
     return {"status": "success"}
@@ -1926,7 +1936,6 @@ async def remove_movie_from_collection(
         {
             "$inc": {"movies_count": -1},
             "$set": {
-                "last_interaction": datetime.now(italy_tz).isoformat(),
                 "data_updated_at": datetime.now(italy_tz).isoformat()
             }
         }
@@ -1965,17 +1974,19 @@ async def update_movie_rating(
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Film non trovato nella collezione")
     
-    # Pubblica evento Kafka per elaborazione Spark
-    kafka_producer = get_kafka_producer()
-    kafka_producer.send_movie_event("UPDATE", current_user_id, {
-        "name": movie.name, "year": movie.year, "rating": movie.rating
-    })
-    
-    # Aggiorna timestamp interazione per sync UI
+    # Aggiorna timestamp per invalidare cache e triggerare ricalcolo
     users_collection.update_one(
         {"user_id": current_user_id},
-        {"$set": {"last_interaction": datetime.now(italy_tz).isoformat()}}
+        {"$set": {"data_updated_at": datetime.now(italy_tz).isoformat()}}
     )
+    
+    # Triggera ricalcolo statistiche via Spark con batch RECALCULATE
+    all_movies = list(movies_collection.find({"user_id": current_user_id}))
+    try:
+        kafka_producer = get_kafka_producer()
+        kafka_producer.send_batch_event("RECALCULATE", current_user_id, all_movies)
+    except Exception as e:
+        print(f"⚠️ Errore invio Kafka: {e}")
     
     # Stats aggiornate via Kafka/Spark
     return {"message": "Rating aggiornato con successo"}
