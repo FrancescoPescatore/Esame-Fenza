@@ -578,3 +578,317 @@ user_stats = {
 ```
 
 Queste metriche **non sono incrementabili** → serve ricalcolo completo.
+
+---
+
+## Come Scalerei per Milioni di Utenti: Lambda Architecture
+
+L'architettura attuale funziona bene per **piccola/media scala** (fino a ~100k utenti). Per scalare a **milioni di utenti** (scenario Netflix/Spotify), adotterei la **Lambda Architecture**.
+
+---
+
+### Il Problema della Scala
+
+| Scala | Utenti | Eventi/giorno | Approccio Attuale | Performance |
+|-------|--------|---------------|-------------------|-------------|
+| **Piccola** | < 10k | ~50k | ✅ Funziona | < 100ms |
+| **Media** | 10k - 100k | ~500k | ⚠️ Accettabile | 100-500ms |
+| **Grande** | 100k - 1M | ~5M | ❌ Rallenta | > 1s |
+| **Enorme** | > 1M | > 50M | ❌ Non scala | Timeout |
+
+**Perché non scala?**
+- Ogni evento utente → query MongoDB per TUTTI i suoi film
+- Con utenti "power user" (10k+ film) → query pesanti
+- Con milioni di eventi → troppi accessi concorrenti a MongoDB
+
+---
+
+### Soluzione: Lambda Architecture
+
+```mermaid
+flowchart TB
+    subgraph "📥 Data Ingestion"
+        K[Kafka Topic]
+    end
+    
+    subgraph "⚡ Speed Layer (Real-time)"
+        K --> SS[Spark Streaming]
+        SS --> R[(Redis Cache)]
+        SS --> |Contatori incrementali| R
+    end
+    
+    subgraph "📦 Batch Layer (Accurato)"
+        K --> DL[(Data Lake / S3)]
+        DL --> SB[Spark Batch Job]
+        SB --> |Notte: ricalcolo completo| M[(MongoDB)]
+    end
+    
+    subgraph "🖥️ Serving Layer"
+        R --> API[API Gateway]
+        M --> API
+        API --> |Merge real-time + batch| U[User Response]
+    end
+```
+
+---
+
+### Speed Layer: Statistiche Approssimate in Tempo Reale
+
+Il **Speed Layer** fornisce statistiche immediate ma potenzialmente imprecise.
+
+```python
+# Speed Layer - contatori incrementali in Redis
+class SpeedLayerProcessor:
+    def __init__(self):
+        self.redis = Redis(host="redis-cluster", decode_responses=True)
+    
+    def process_event(self, event):
+        user_id = event["user_id"]
+        
+        if event["type"] == "ADD":
+            # Incrementa contatori (O(1) - velocissimo!)
+            self.redis.hincrby(f"user:{user_id}:speed", "movie_count", 1)
+            self.redis.hincrbyfloat(f"user:{user_id}:speed", "rating_sum", event["rating"])
+            self.redis.hincrby(f"user:{user_id}:genres", event["genre"], 1)
+            
+        elif event["type"] == "DELETE":
+            # Decrementa contatori
+            self.redis.hincrby(f"user:{user_id}:speed", "movie_count", -1)
+            self.redis.hincrbyfloat(f"user:{user_id}:speed", "rating_sum", -event["rating"])
+            self.redis.hincrby(f"user:{user_id}:genres", event["genre"], -1)
+        
+        # Calcola media "live" (approssimata)
+        speed_data = self.redis.hgetall(f"user:{user_id}:speed")
+        if int(speed_data.get("movie_count", 0)) > 0:
+            avg = float(speed_data["rating_sum"]) / int(speed_data["movie_count"])
+            self.redis.hset(f"user:{user_id}:speed", "avg_rating_live", avg)
+```
+
+**Caratteristiche:**
+- ⚡ Latenza: **< 10ms**
+- ⚠️ Accuratezza: ~95% (può driftare nel tempo)
+- 📊 Statistiche: Solo contatori e medie semplici
+
+---
+
+### Batch Layer: Ricalcolo Completo Notturno
+
+Il **Batch Layer** garantisce accuratezza ricalcolando tutto ogni notte.
+
+```python
+# Batch Layer - Job Spark che gira ogni notte (es. 3:00 AM)
+def nightly_batch_job():
+    spark = SparkSession.builder \
+        .appName("UserStatsBatchJob") \
+        .config("spark.mongodb.read.connection.uri", MONGO_URI) \
+        .getOrCreate()
+    
+    # 1. Legge TUTTO dal Data Lake (eventi degli ultimi 30 giorni)
+    events_df = spark.read.parquet("s3://data-lake/user-events/")
+    
+    # 2. Legge tutti i film dal catalogo
+    movies_df = spark.read.format("mongodb") \
+        .option("collection", "movies") \
+        .load()
+    
+    # 3. Join e aggregazione con la potenza di Spark
+    user_stats = events_df \
+        .join(movies_df, "movie_id") \
+        .groupBy("user_id") \
+        .agg(
+            count("*").alias("total_watched"),
+            avg("rating").alias("avg_rating"),
+            collect_list(struct("title", "rating")).alias("movies_list"),
+            # ... altre aggregazioni complesse
+        )
+    
+    # 4. Calcolo statistiche complesse con UDF
+    @udf(returnType=StringType())
+    def compute_favorite_genre(movies_list):
+        genres = [m.genre for m in movies_list]
+        return Counter(genres).most_common(1)[0][0]
+    
+    user_stats = user_stats.withColumn(
+        "favorite_genre", 
+        compute_favorite_genre(col("movies_list"))
+    )
+    
+    # 5. Scrivi risultato su MongoDB (sovrascrive)
+    user_stats.write.format("mongodb") \
+        .option("collection", "user_stats_batch") \
+        .mode("overwrite") \
+        .save()
+    
+    # 6. Resetta i contatori Speed Layer in Redis
+    reset_speed_layer_deltas()
+    
+    print(f"✅ Batch job completato: {user_stats.count()} utenti elaborati")
+```
+
+**Caratteristiche:**
+- 🐢 Latenza: **ore** (job notturno)
+- ✅ Accuratezza: **100%** (ricalcolo completo)
+- 📊 Statistiche: Tutte, anche le più complesse
+
+---
+
+### Serving Layer: Merge Intelligente
+
+L'API combina i dati dei due layer per dare la risposta migliore.
+
+```python
+# Serving Layer - API che unisce Speed + Batch
+class UserStatsService:
+    def __init__(self):
+        self.redis = Redis(host="redis-cluster")
+        self.mongo = MongoClient(MONGO_URI)
+    
+    def get_user_stats(self, user_id: str) -> dict:
+        # 1. Leggi statistiche batch (accurate, ma vecchie di max 24h)
+        batch_stats = self.mongo.db.user_stats_batch.find_one({"user_id": user_id})
+        
+        # 2. Leggi delta dal Speed Layer (eventi da ultimo batch)
+        speed_delta = self.redis.hgetall(f"user:{user_id}:speed")
+        
+        # 3. Merge intelligente
+        merged_stats = {
+            # Contatori: batch + delta speed
+            "total_watched": batch_stats["total_watched"] + int(speed_delta.get("movie_count", 0)),
+            
+            # Media: ricalcola con i delta
+            "avg_rating": self._merge_averages(
+                batch_avg=batch_stats["avg_rating"],
+                batch_count=batch_stats["total_watched"],
+                delta_sum=float(speed_delta.get("rating_sum", 0)),
+                delta_count=int(speed_delta.get("movie_count", 0))
+            ),
+            
+            # Statistiche complesse: usa batch (troppo costoso calcolare live)
+            "top_rated_movies": batch_stats["top_rated_movies"],
+            "best_directors": batch_stats["best_directors"],
+            
+            # Metadata
+            "batch_updated_at": batch_stats["updated_at"],
+            "realtime_delta_count": int(speed_delta.get("movie_count", 0))
+        }
+        
+        return merged_stats
+    
+    def _merge_averages(self, batch_avg, batch_count, delta_sum, delta_count):
+        """Combina media batch con delta speed layer."""
+        if delta_count == 0:
+            return batch_avg
+        
+        total_sum = (batch_avg * batch_count) + delta_sum
+        total_count = batch_count + delta_count
+        return total_sum / total_count
+```
+
+---
+
+### Architettura Completa
+
+```mermaid
+sequenceDiagram
+    participant U as Utente
+    participant API as API Gateway
+    participant K as Kafka
+    participant SS as Spark Streaming
+    participant R as Redis (Speed)
+    participant DL as Data Lake
+    participant SB as Spark Batch
+    participant M as MongoDB (Batch)
+    
+    Note over U,M: Flusso Real-time (Speed Layer)
+    U->>API: POST /movies (aggiungi film)
+    API->>K: Pubblica evento
+    API->>U: 200 OK (< 50ms)
+    K->>SS: Consuma evento
+    SS->>R: Incrementa contatori
+    
+    Note over U,M: Flusso Query (Serving Layer)
+    U->>API: GET /stats
+    API->>M: Leggi batch stats
+    API->>R: Leggi delta speed
+    API->>API: Merge
+    API->>U: Stats combinate
+    
+    Note over U,M: Flusso Notturno (Batch Layer)
+    K->>DL: Persiste tutti gli eventi
+    SB->>DL: Legge eventi 30 giorni
+    SB->>SB: Ricalcola tutto
+    SB->>M: Sovrascrive user_stats
+    SB->>R: Reset delta counters
+```
+
+---
+
+### Confronto: Architettura Attuale vs Lambda
+
+| Aspetto | Attuale (Micro-batch) | Lambda Architecture |
+|---------|----------------------|---------------------|
+| **Complessità** | ⭐⭐ Semplice | ⭐⭐⭐⭐⭐ Complessa |
+| **Componenti** | Kafka, Spark, MongoDB | Kafka, Spark×2, Redis, Data Lake, MongoDB |
+| **Costo infrastruttura** | €€ | €€€€€ |
+| **Latenza real-time** | ~1 secondo | < 10ms |
+| **Accuratezza real-time** | 100% | ~95-99% |
+| **Scala massima** | ~100k utenti | Milioni di utenti |
+| **Recovery da failure** | Checkpoint Spark | Event replay da Data Lake |
+| **Team necessario** | 1-2 sviluppatori | Team di data engineering |
+
+---
+
+### Quando Migrare a Lambda?
+
+```mermaid
+flowchart TD
+    A[Quanti utenti attivi?] --> B{< 100k?}
+    B -->|Sì| C[✅ Architettura attuale OK]
+    B -->|No| D{Latenza < 100ms richiesta?}
+    D -->|No| E[⚠️ Ottimizza prima MongoDB]
+    D -->|Sì| F{Budget per infrastruttura?}
+    F -->|No| G[⚠️ Considera cache Redis semplice]
+    F -->|Sì| H[✅ Migra a Lambda Architecture]
+    
+    E --> I[Indici, sharding, read replicas]
+    G --> J[Redis davanti a MongoDB]
+```
+
+---
+
+### Implementazione Graduale
+
+Se dovessi scalare il progetto attuale, lo farei in **3 fasi**:
+
+#### Fase 1: Aggiungi Cache Redis (Settimane)
+```python
+# Mantieni architettura attuale, aggiungi cache
+def get_user_stats(user_id):
+    cached = redis.get(f"stats:{user_id}")
+    if cached:
+        return json.loads(cached)
+    
+    stats = compute_from_mongodb(user_id)
+    redis.setex(f"stats:{user_id}", 300, json.dumps(stats))  # Cache 5 min
+    return stats
+```
+
+#### Fase 2: Speed Layer Incrementale (Mesi)
+- Aggiungi contatori Redis per statistiche semplici
+- Mantieni ricalcolo MongoDB per statistiche complesse
+- API fa merge
+
+#### Fase 3: Lambda Completa (Trimestre)
+- Aggiungi Data Lake (S3/HDFS)
+- Implementa batch job notturno
+- Migra query complesse al batch layer
+
+---
+
+### Conclusione
+
+> **Per questo progetto**: L'architettura micro-batch attuale è **la scelta giusta**.
+> 
+> **Per scalare a produzione**: Evolverei verso Lambda Architecture, ma solo quando i numeri lo richiedono.
+> 
+> La regola d'oro: **"Premature optimization is the root of all evil"** - Donald Knuth
