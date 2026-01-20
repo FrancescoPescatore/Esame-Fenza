@@ -183,7 +183,7 @@ def migrate_affinities():
     client.close()
 
 
-def cleanup_old_fields():
+def cleanup_old_fields(force=False):
     """
     Rimuove i campi obsoleti da user_stats (OPZIONALE - eseguire dopo test).
     ⚠️ Eseguire SOLO dopo aver verificato che tutto funziona!
@@ -194,11 +194,14 @@ def cleanup_old_fields():
     print("🧹 CLEANUP: Rimozione campi obsoleti da user_stats...")
     print("⚠️ ATTENZIONE: Questa operazione è IRREVERSIBILE!")
     
-    confirm = input("Digitare 'CONFERMA' per procedere: ")
-    if confirm != "CONFERMA":
-        print("❌ Operazione annullata.")
-        client.close()
-        return
+    if not force:
+        confirm = input("Digitare 'CONFERMA' per procedere: ")
+        if confirm != "CONFERMA":
+            print("❌ Operazione annullata.")
+            client.close()
+            return
+    else:
+        print("⚠️ Modalità FORCE attiva: salto conferma interattiva.")
     
     result = db.user_stats.update_many(
         {},
@@ -222,8 +225,9 @@ if __name__ == "__main__":
     import sys
     
     if len(sys.argv) > 1 and sys.argv[1] == "--cleanup":
-        cleanup_old_fields()
+        force_mode = "--force" in sys.argv
+        cleanup_old_fields(force=force_mode)
     else:
         migrate_affinities()
         print("\n💡 Per rimuovere i campi obsoleti da user_stats, esegui:")
-        print("   python migrate_affinities.py --cleanup")
+        print("   python migrate_affinities.py --cleanup [--force]")

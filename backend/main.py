@@ -262,6 +262,29 @@ async def startup_event():
     italy_tz = pytz.timezone('Europe/Rome')
     scheduler.add_job(scheduled_cinema_pipeline, 'cron', hour=0, minute=0, timezone=italy_tz, id='cinema_pipeline')
     
+    # Incremental Embedding Update alle 00:30 (dopo aggiornamento film)
+    def scheduled_embedding_update():
+        """Aggiorna embeddings per i nuovi film aggiunti a mezzanotte."""
+        import subprocess
+        try:
+            print("🧬 [Embeddings] Avvio aggiornamento incrementale...")
+            result = subprocess.run(
+                ["python", "embedding_and_faiss/incremental_embedding_update.py"],
+                cwd="/app",
+                capture_output=True,
+                text=True,
+                timeout=3600  # Max 1 ora
+            )
+            if result.returncode == 0:
+                print("✅ [Embeddings] Aggiornamento completato.")
+                print(result.stdout)
+            else:
+                print(f"❌ [Embeddings] Errore: {result.stderr}")
+        except Exception as e:
+            print(f"❌ [Embeddings] Errore aggiornamento: {e}")
+    
+    scheduler.add_job(scheduled_embedding_update, 'cron', hour=0, minute=30, timezone=italy_tz, id='embedding_update')
+    
     # Quiz AI generation alle 03:00 (ogni notte)
     def scheduled_quiz_generation():
         """Genera 5 domande quiz giornaliere usando Ollama."""
@@ -1007,7 +1030,7 @@ async def get_scraper_progress():
 # ============================================
 # DATA ENDPOINTS
 # ============================================
-def process_missing_movies_background(titles_years: list, user_id: str):
+def process_missing_movies_background(titles_years: list, user_id: str, trigger_kafka_update: bool = False):
     """
     Task in background per cercare i film mancanti su TMDB 
     e poi aggiornare le statistiche dell'utente.
@@ -1051,13 +1074,15 @@ def process_missing_movies_background(titles_years: list, user_id: str):
                 
     print(f"✅ [Background] Aggiunti {added_count} nuovi film al catalogo.")
     
-    # NOTA: NON inviamo più eventi RECALCULATE qui!
-    # Il BULK_IMPORT iniziale ha già inviato tutti i film a Spark.
-    # Inviare di nuovo causerebbe DUPLICAZIONE delle statistiche.
-    # Se servono i metadati aggiornati (director, actors, etc.), il prossimo
-    # evento singolo o un refresh manuale li utilizzerà dal catalogo aggiornato.
+    # 2. Triggera ricalcolo statistiche via Kafka/Spark se sono stati aggiunti film
     if added_count > 0:
-        print(f"✅ [Background] Catalogo arricchito con {added_count} film. Le stats usano già i dati del BULK_IMPORT iniziale.")
+        print("🔄 [Background] Triggering ricalcolo statistiche via Kafka/Spark...")
+        movies = list(movies_collection.find({"user_id": user_id}))
+        if movies:
+            # Pubblica evento su Kafka per far ricalcolare le statistiche a Spark
+            kafka_producer = get_kafka_producer()
+            kafka_producer.send_batch_event("RECALCULATE", user_id, movies)
+            print("✅ [Background] Evento inviato a Spark per ricalcolo statistiche.")
 
 
 @app.post("/upload-csv")
@@ -1192,7 +1217,7 @@ async def upload_csv(
     
     # Avvia task in background per i film mancanti
     titles_years = list(set([(m["name"], m["year"]) for m in movies]))
-    background_tasks.add_task(process_missing_movies_background, titles_years, current_user_id)
+    background_tasks.add_task(process_missing_movies_background, titles_years, current_user_id, trigger_kafka_update=False)
     
     return {
         "status": "success",
