@@ -24,6 +24,8 @@ from auth import get_password_hash, verify_password, create_access_token, get_cu
 from quiz_generator import get_daily_questions, run_daily_quiz_generation
 from cinema_pipeline import run_full_pipeline
 from kafka_producer import get_kafka_producer
+from YoutubeComments import get_upcoming_movie_with_trailer
+from YoutubeComments2 import get_latest_comment_for_trailer
 
 # ============================================
 # APP CONFIGURATION
@@ -603,6 +605,61 @@ async def get_preset_avatars():
         {"id": 9, "name": "Ana de Armas", "url": "https://pbs.twimg.com/media/Ec2RTm5XgAISWIh.jpg"},
         {"id": 10, "name": "Cat Woman", "url": "https://hips.hearstapps.com/hmg-prod/images/catwoman-storia-1647942111.jpeg?crop=1.00xw:0.663xh;0,0.0417xh&resize=640:*"}
     ]
+
+# ============================================
+# YOUTUBE COMMENTS ENDPOINTS
+# ============================================
+@app.get("/upcoming-movie-trailer")
+async def get_upcoming_trailer():
+    """Ottiene il primo film in uscita il mese prossimo con il suo trailer YouTube."""
+    try:
+        movie_data = get_upcoming_movie_with_trailer()
+        if movie_data:
+            return {
+                "status": "success",
+                "data": movie_data
+            }
+        else:
+            return {
+                "status": "not_found",
+                "message": "Nessun film trovato per il mese prossimo"
+            }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
+@app.get("/latest-trailer-comment")
+async def get_latest_trailer_comment():
+    """Ottiene l'ultimo commento valido dal trailer del film in uscita."""
+    try:
+        # Prima ottieni i dati del film per avere l'URL del trailer
+        movie_data = get_upcoming_movie_with_trailer()
+        if not movie_data or not movie_data.get("trailer_url"):
+            return {
+                "status": "not_found",
+                "message": "Nessun trailer disponibile"
+            }
+        
+        # Ottieni l'ultimo commento dal trailer
+        comment_data = get_latest_comment_for_trailer(movie_data["trailer_url"])
+        
+        if comment_data:
+            return {
+                "status": "success",
+                "data": comment_data
+            }
+        else:
+            return {
+                "status": "not_found",
+                "message": "Nessun commento trovato per questo trailer"
+            }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
 
 # ============================================
 # CINEMA ENDPOINTS

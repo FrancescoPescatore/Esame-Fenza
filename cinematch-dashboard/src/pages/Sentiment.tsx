@@ -1,15 +1,7 @@
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, LineChart, Line } from 'recharts';
-import { SentimentGauge } from '../components/SentimentGauge';
+import { useState, useEffect } from 'react';
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { sentimentPosts } from '../data/mockData';
 import './Sentiment.css';
-
-const sentimentOverTime = [
-    { date: '01 Mar', positive: 75, negative: 25 },
-    { date: '02 Mar', positive: 82, negative: 18 },
-    { date: '03 Mar', positive: 78, negative: 22 },
-    { date: '04 Mar', positive: 85, negative: 15 },
-    { date: '05 Mar', positive: 88, negative: 12 },
-];
 
 const topKeywords = [
     { word: 'visuals', count: 1250 },
@@ -20,8 +12,67 @@ const topKeywords = [
     { word: 'Timothée', count: 590 },
 ];
 
+interface MovieData {
+    title: string;
+    release_date: string;
+    trailer_url: string | null;
+    embed_id: string | null;
+}
+
+interface CommentData {
+    author: string;
+    published_at: string;
+    text: string;
+}
+
 export function Sentiment() {
-    const overallSentiment = 87;
+    const [movieData, setMovieData] = useState<MovieData | null>(null);
+    const [commentData, setCommentData] = useState<CommentData | null>(null);
+    const [loading, setLoading] = useState(true);
+    const [commentLoading, setCommentLoading] = useState(true);
+    const [error, setError] = useState<string | null>(null);
+    const [commentError, setCommentError] = useState<string | null>(null);
+
+    useEffect(() => {
+        const fetchMovieData = async () => {
+            try {
+                const response = await fetch('http://localhost:8000/upcoming-movie-trailer');
+                const result = await response.json();
+
+                if (result.status === 'success' && result.data) {
+                    setMovieData(result.data);
+                } else {
+                    setError(result.message || 'Nessun film trovato');
+                }
+            } catch (err) {
+                setError('Errore di connessione al server');
+                console.error('Error fetching movie data:', err);
+            } finally {
+                setLoading(false);
+            }
+        };
+
+        const fetchCommentData = async () => {
+            try {
+                const response = await fetch('http://localhost:8000/latest-trailer-comment');
+                const result = await response.json();
+
+                if (result.status === 'success' && result.data) {
+                    setCommentData(result.data);
+                } else {
+                    setCommentError(result.message || 'Nessun commento trovato');
+                }
+            } catch (err) {
+                setCommentError('Errore di connessione al server');
+                console.error('Error fetching comment data:', err);
+            } finally {
+                setCommentLoading(false);
+            }
+        };
+
+        fetchMovieData();
+        fetchCommentData();
+    }, []);
 
     const getSentimentColor = (sentiment: string) => {
         switch (sentiment) {
@@ -31,79 +82,135 @@ export function Sentiment() {
         }
     };
 
+    const formatDate = (dateStr: string) => {
+        const date = new Date(dateStr);
+        return date.toLocaleDateString('it-IT', {
+            day: 'numeric',
+            month: 'long',
+            year: 'numeric'
+        });
+    };
+
+    const formatDateTime = (dateStr: string) => {
+        const date = new Date(dateStr);
+        return date.toLocaleDateString('it-IT', {
+            day: 'numeric',
+            month: 'long',
+            year: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit'
+        });
+    };
+
     return (
         <div className="sentiment-page">
             <div className="page-header">
-                <h1>💬 Sentiment Analysis</h1>
-                <p>Analisi del sentiment da Reddit usando RoBERTa</p>
+                <h1>💬 Commenti YouTube</h1>
+                <p>Scopri i trailer dei film in uscita il mese prossimo</p>
             </div>
 
             <div className="sentiment-overview">
-                <div className="overview-card main-gauge">
-                    <h3>Sentiment Complessivo</h3>
-                    <SentimentGauge score={overallSentiment} size="large" />
-                    <div className="model-badge">
-                        <span className="model-icon">🤖</span>
-                        Powered by RoBERTa
-                    </div>
+                <div className="overview-card main-gauge trailer-card">
+                    <h3>🎬 Trailer YouTube</h3>
+                    {loading ? (
+                        <div className="trailer-loading">
+                            <span>Caricamento trailer...</span>
+                        </div>
+                    ) : error ? (
+                        <div className="trailer-error">
+                            <span>⚠️ {error}</span>
+                        </div>
+                    ) : movieData?.embed_id ? (
+                        <div className="youtube-player">
+                            <iframe
+                                src={`https://www.youtube.com/embed/${movieData.embed_id}`}
+                                title={movieData.title}
+                                frameBorder="0"
+                                allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                                allowFullScreen
+                            ></iframe>
+                        </div>
+                    ) : (
+                        <div className="trailer-error">
+                            <span>⚠️ Trailer non disponibile</span>
+                        </div>
+                    )}
                 </div>
 
-                <div className="overview-card stats-card">
-                    <h3>📊 Statistiche</h3>
-                    <div className="stat-item">
-                        <span className="stat-label">Post Analizzati</span>
-                        <span className="stat-value">1,247</span>
-                    </div>
-                    <div className="stat-item">
-                        <span className="stat-label">Subreddit Monitorati</span>
-                        <span className="stat-value">5</span>
-                    </div>
-                    <div className="stat-item">
-                        <span className="stat-label">Ultimo Aggiornamento</span>
-                        <span className="stat-value">2 min fa</span>
-                    </div>
-                    <div className="stat-item">
-                        <span className="stat-label">Commenti Positivi</span>
-                        <span className="stat-value positive">87%</span>
-                    </div>
+                <div className="overview-card stats-card movie-info-card">
+                    <h3>🎬 Informazioni sul film</h3>
+                    {loading ? (
+                        <div className="movie-info-loading">
+                            <span>Caricamento...</span>
+                        </div>
+                    ) : error ? (
+                        <div className="movie-info-error">
+                            <span>Nessuna informazione disponibile</span>
+                        </div>
+                    ) : movieData ? (
+                        <div className="movie-info-content">
+                            <div className="movie-info-item">
+                                <span className="info-label">Nome Film</span>
+                                <span className="info-value">{movieData.title}</span>
+                            </div>
+                            <div className="movie-info-item">
+                                <span className="info-label">Data di Uscita</span>
+                                <span className="info-value">{formatDate(movieData.release_date)}</span>
+                            </div>
+                            <div className="movie-info-item">
+                                <span className="info-label">Link Trailer</span>
+                                {movieData.trailer_url ? (
+                                    <a
+                                        href={movieData.trailer_url}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="info-link"
+                                    >
+                                        Apri su YouTube ↗
+                                    </a>
+                                ) : (
+                                    <span className="info-value">Non disponibile</span>
+                                )}
+                            </div>
+                        </div>
+                    ) : null}
                 </div>
             </div>
 
             <div className="charts-grid">
-                <div className="chart-card">
-                    <h3>📈 Trend Sentiment nel Tempo</h3>
-                    <ResponsiveContainer width="100%" height={250}>
-                        <LineChart data={sentimentOverTime}>
-                            <CartesianGrid strokeDasharray="3 3" stroke="#333" />
-                            <XAxis dataKey="date" stroke="#808080" />
-                            <YAxis stroke="#808080" />
-                            <Tooltip
-                                contentStyle={{
-                                    background: '#222',
-                                    border: '1px solid #333',
-                                    borderRadius: '8px'
-                                }}
-                            />
-                            <Line
-                                type="monotone"
-                                dataKey="positive"
-                                stroke="#00c853"
-                                strokeWidth={3}
-                                dot={{ fill: '#00c853', strokeWidth: 2 }}
-                            />
-                            <Line
-                                type="monotone"
-                                dataKey="negative"
-                                stroke="#ef4444"
-                                strokeWidth={3}
-                                dot={{ fill: '#ef4444', strokeWidth: 2 }}
-                            />
-                        </LineChart>
-                    </ResponsiveContainer>
+                <div className="chart-card comment-card">
+                    <h3>📈 Ultimo Commento al Trailer</h3>
+                    {commentLoading ? (
+                        <div className="comment-loading">
+                            <span>Caricamento commento...</span>
+                        </div>
+                    ) : commentError ? (
+                        <div className="comment-error">
+                            <span>⚠️ {commentError}</span>
+                        </div>
+                    ) : commentData ? (
+                        <div className="comment-content">
+                            <div className="comment-author">
+                                <span className="author-icon">👤</span>
+                                <span className="author-name">{commentData.author}</span>
+                            </div>
+                            <div className="comment-date">
+                                <span className="date-icon">📅</span>
+                                <span className="date-value">{formatDateTime(commentData.published_at)}</span>
+                            </div>
+                            <div className="comment-text">
+                                <p>"{commentData.text}"</p>
+                            </div>
+                        </div>
+                    ) : (
+                        <div className="comment-error">
+                            <span>Nessun commento disponibile</span>
+                        </div>
+                    )}
                 </div>
 
                 <div className="chart-card">
-                    <h3>🔤 Parole Chiave Frequenti</h3>
+                    <h3>🔤 Prova</h3>
                     <ResponsiveContainer width="100%" height={250}>
                         <BarChart data={topKeywords} layout="vertical">
                             <CartesianGrid strokeDasharray="3 3" stroke="#333" />
