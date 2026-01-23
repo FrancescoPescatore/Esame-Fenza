@@ -12,6 +12,20 @@ interface CommentData {
     author: string;
     published_at: string;
     text: string;
+    valore_sentiment?: number | null;
+}
+
+interface SentimentStats {
+    average: number | null;
+    total_comments: number;
+    comments_with_sentiment: number;
+    label: string;
+    collection: string;
+}
+
+interface SentimentAverages {
+    commenti_live: SentimentStats;
+    commenti_votati: SentimentStats;
 }
 
 export function Sentiment() {
@@ -31,6 +45,10 @@ export function Sentiment() {
     const [liveCommentsError, setLiveCommentsError] = useState<string | null>(null);
     const [currentLiveIndex, setCurrentLiveIndex] = useState(0);
     const [streamingActive, setStreamingActive] = useState(false);
+
+    // State per le medie del sentiment
+    const [sentimentAverages, setSentimentAverages] = useState<SentimentAverages | null>(null);
+    const [sentimentLoading, setSentimentLoading] = useState(true);
 
     useEffect(() => {
         const fetchMovieData = async () => {
@@ -111,10 +129,31 @@ export function Sentiment() {
         fetchCommentsData();
         fetchLiveComments();
 
+        // Fetch sentiment averages
+        const fetchSentimentAverages = async () => {
+            try {
+                const response = await fetch('http://localhost:8000/sentiment-averages');
+                const result = await response.json();
+                if (result.status === 'success' && result.data) {
+                    setSentimentAverages(result.data);
+                }
+            } catch (err) {
+                console.error('Error fetching sentiment averages:', err);
+            } finally {
+                setSentimentLoading(false);
+            }
+        };
+        fetchSentimentAverages();
+
         // Polling per aggiornare i commenti live ogni 30 secondi
         const liveInterval = setInterval(fetchLiveComments, 30000);
+        // Polling per aggiornare le medie del sentiment ogni 60 secondi
+        const sentimentInterval = setInterval(fetchSentimentAverages, 60000);
 
-        return () => clearInterval(liveInterval);
+        return () => {
+            clearInterval(liveInterval);
+            clearInterval(sentimentInterval);
+        };
     }, []);
 
     const formatDate = (dateStr: string) => {
@@ -261,6 +300,14 @@ export function Sentiment() {
                                         <div className="comment-text live-comment-text">
                                             <p>"{currentLiveComment.text}"</p>
                                         </div>
+                                        {currentLiveComment.valore_sentiment !== undefined && currentLiveComment.valore_sentiment !== null && (
+                                            <div className="comment-sentiment">
+                                                <span className={`sentiment-badge ${currentLiveComment.valore_sentiment > 0.2 ? 'positive' : currentLiveComment.valore_sentiment < -0.2 ? 'negative' : 'neutral'}`}>
+                                                    {currentLiveComment.valore_sentiment > 0.2 ? '😊' : currentLiveComment.valore_sentiment < -0.2 ? '😞' : '😐'}
+                                                    {' '}{(currentLiveComment.valore_sentiment * 100).toFixed(0)}%
+                                                </span>
+                                            </div>
+                                        )}
                                     </>
                                 )}
                             </div>
@@ -304,33 +351,79 @@ export function Sentiment() {
                 </div>
 
                 <div className="chart-card comment-card">
-                    <h3>📈 Ultimo Commento al Trailer</h3>
-                    {commentLoading ? (
-                        <div className="comment-loading">
-                            <span>Caricamento commento...</span>
-                        </div>
-                    ) : commentError ? (
-                        <div className="comment-error">
-                            <span>⚠️ {commentError}</span>
-                        </div>
-                    ) : commentData ? (
-                        <div className="comment-content">
-                            <div className="comment-author">
-                                <span className="author-icon">👤</span>
-                                <span className="author-name">{commentData.author}</span>
+                    <h3>📊 Sentiment Analysis</h3>
+                    {sentimentLoading ? (
+                        <div className="sentiment-loading">Caricamento analisi...</div>
+                    ) : sentimentAverages ? (
+                        <div className="sentiment-averages-container">
+                            {/* Commenti Live */}
+                            <div className="sentiment-avg-card">
+                                <div className="avg-header">
+                                    <span className="avg-title">🔴 Commenti Live</span>
+                                    <span className="avg-count">
+                                        {sentimentAverages.commenti_live.comments_with_sentiment} / {sentimentAverages.commenti_live.total_comments}
+                                    </span>
+                                </div>
+                                <div className="sentiment-gauge">
+                                    <div className="gauge-bar">
+                                        <div
+                                            className={`gauge-fill ${sentimentAverages.commenti_live.label}`}
+                                            style={{
+                                                width: sentimentAverages.commenti_live.average !== null
+                                                    ? `${Math.abs(sentimentAverages.commenti_live.average) * 100}%`
+                                                    : '0%'
+                                            }}
+                                        />
+                                    </div>
+                                    <div className="gauge-value">
+                                        {sentimentAverages.commenti_live.average !== null ? (
+                                            <span className={`value-label ${sentimentAverages.commenti_live.label}`}>
+                                                {sentimentAverages.commenti_live.label === 'positive' ? '😊' :
+                                                    sentimentAverages.commenti_live.label === 'negative' ? '😞' : '😐'}
+                                                {' '}{(sentimentAverages.commenti_live.average * 100).toFixed(0)}%
+                                            </span>
+                                        ) : (
+                                            <span className="no-data">Nessun dato</span>
+                                        )}
+                                    </div>
+                                </div>
                             </div>
-                            <div className="comment-date">
-                                <span className="date-icon">📅</span>
-                                <span className="date-value">{formatDateTime(commentData.published_at)}</span>
-                            </div>
-                            <div className="comment-text">
-                                <p>"{commentData.text}"</p>
+
+                            {/* Commenti Votati */}
+                            <div className="sentiment-avg-card">
+                                <div className="avg-header">
+                                    <span className="avg-title">📝 Commenti Analizzati</span>
+                                    <span className="avg-count">
+                                        {sentimentAverages.commenti_votati.comments_with_sentiment} / {sentimentAverages.commenti_votati.total_comments}
+                                    </span>
+                                </div>
+                                <div className="sentiment-gauge">
+                                    <div className="gauge-bar">
+                                        <div
+                                            className={`gauge-fill ${sentimentAverages.commenti_votati.label}`}
+                                            style={{
+                                                width: sentimentAverages.commenti_votati.average !== null
+                                                    ? `${Math.abs(sentimentAverages.commenti_votati.average) * 100}%`
+                                                    : '0%'
+                                            }}
+                                        />
+                                    </div>
+                                    <div className="gauge-value">
+                                        {sentimentAverages.commenti_votati.average !== null ? (
+                                            <span className={`value-label ${sentimentAverages.commenti_votati.label}`}>
+                                                {sentimentAverages.commenti_votati.label === 'positive' ? '😊' :
+                                                    sentimentAverages.commenti_votati.label === 'negative' ? '😞' : '😐'}
+                                                {' '}{(sentimentAverages.commenti_votati.average * 100).toFixed(0)}%
+                                            </span>
+                                        ) : (
+                                            <span className="no-data">Nessun dato</span>
+                                        )}
+                                    </div>
+                                </div>
                             </div>
                         </div>
                     ) : (
-                        <div className="comment-error">
-                            <span>Nessun commento disponibile</span>
-                        </div>
+                        <div className="sentiment-error">Nessun dato disponibile</div>
                     )}
                 </div>
             </div>
@@ -352,6 +445,14 @@ export function Sentiment() {
                                     <span className="post-date">📅 {formatDateTime(comment.published_at)}</span>
                                 </div>
                                 <p className="comment-text-content">"{comment.text}"</p>
+                                {comment.valore_sentiment !== undefined && comment.valore_sentiment !== null && (
+                                    <div className="comment-sentiment">
+                                        <span className={`sentiment-badge ${comment.valore_sentiment > 0.2 ? 'positive' : comment.valore_sentiment < -0.2 ? 'negative' : 'neutral'}`}>
+                                            {comment.valore_sentiment > 0.2 ? '😊 Positivo' : comment.valore_sentiment < -0.2 ? '😞 Negativo' : '😐 Neutro'}
+                                            {' '}({(comment.valore_sentiment * 100).toFixed(0)}%)
+                                        </span>
+                                    </div>
+                                )}
                             </div>
                         ))}
                     </div>

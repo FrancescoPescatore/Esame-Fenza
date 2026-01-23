@@ -168,6 +168,24 @@
     color: white;
 }
 
+.sentiment-badge.positive {
+    background: linear-gradient(135deg, #00c853, #009624);
+}
+
+.sentiment-badge.negative {
+    background: linear-gradient(135deg, #ff5252, #d32f2f);
+}
+
+.sentiment-badge.neutral {
+    background: linear-gradient(135deg, #757575, #616161);
+}
+
+.comment-sentiment {
+    margin-top: 12px;
+    display: flex;
+    justify-content: flex-end;
+}
+
 .post-title {
     font-size: 1rem;
     font-weight: 500;
@@ -523,4 +541,126 @@
     font-size: 0.9rem;
     color: var(--text-secondary);
     padding-bottom: 8px;
+}
+
+/* Sentiment Averages Styles */
+.sentiment-loading,
+.sentiment-error {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 150px;
+    color: var(--text-secondary);
+    font-size: 1rem;
+}
+
+.sentiment-averages-container {
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+    padding: 16px 0;
+}
+
+.sentiment-avg-card {
+    background: var(--glass-bg);
+    border-radius: 12px;
+    padding: 16px;
+    border: 1px solid var(--border-color);
+}
+
+.avg-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+}
+
+.avg-title {
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.avg-count {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    background: var(--bg-secondary);
+    padding: 4px 10px;
+    border-radius: 12px;
+}
+
+.sentiment-gauge {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.gauge-bar {
+    height: 24px;
+    background: var(--bg-secondary);
+    border-radius: 12px;
+    overflow: hidden;
+    position: relative;
+}
+
+.gauge-fill {
+    height: 100%;
+    border-radius: 12px;
+    transition: width 0.5s ease;
+    min-width: 10%;
+}
+
+.gauge-fill.positive {
+    background: linear-gradient(90deg, #00c853, #69f0ae);
+}
+
+.gauge-fill.negative {
+    background: linear-gradient(90deg, #ff5252, #ff8a80);
+}
+
+.gauge-fill.neutral {
+    background: linear-gradient(90deg, #757575, #9e9e9e);
+}
+
+.gauge-fill.no_data,
+.gauge-fill.error {
+    background: var(--border-color);
+    width: 0%;
+}
+
+.gauge-value {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+.value-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 14px;
+    border-radius: 16px;
+    font-size: 1rem;
+    font-weight: 600;
+}
+
+.value-label.positive {
+    background: rgba(0, 200, 83, 0.15);
+    color: #00c853;
+}
+
+.value-label.negative {
+    background: rgba(255, 82, 82, 0.15);
+    color: #ff5252;
+}
+
+.value-label.neutral {
+    background: rgba(117, 117, 117, 0.15);
+    color: #9e9e9e;
+}
+
+.no-data {
+    font-size: 0.9rem;
+    color: var(--text-muted);
+    font-style: italic;
 }

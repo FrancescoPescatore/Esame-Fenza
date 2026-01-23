@@ -15,6 +15,17 @@ import threading
 import time
 from typing import List, Dict, Optional
 from collections import deque
+from pymongo import MongoClient
+from datetime import datetime
+import os
+
+# Import del modulo per il calcolo del sentiment
+try:
+    from YoutubeComments6 import process_pending_comments
+    SENTIMENT_ENABLED = True
+except ImportError:
+    print("[YoutubeComments5] Modulo YoutubeComments6 non disponibile, sentiment disabilitato")
+    SENTIMENT_ENABLED = False
 
 
 # -----------------------------
@@ -26,6 +37,11 @@ MIN_CHARS = 80
 POLLING_INTERVAL = 30  # Secondi tra ogni polling
 
 SPAM_KEYWORDS = ["subscribe"]
+
+# MongoDB Configuration
+MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
+MONGODB_DATABASE = "cinematch_db"
+MONGODB_COLLECTION = "CommentiLive"
 
 
 # -----------------------------
@@ -83,6 +99,69 @@ def is_spam(text: str) -> bool:
         return True
 
     return False
+
+
+# -----------------------------
+# MONGODB
+# -----------------------------
+def get_mongodb_client():
+    """Ottiene il client MongoDB."""
+    try:
+        client = MongoClient(MONGODB_URL)
+        return client
+    except Exception as e:
+        print(f"[MongoDB] Errore connessione: {e}")
+        return None
+
+
+def save_comments_to_mongodb(comments: List[Dict]) -> bool:
+    """
+    Salva i commenti nella collezione CommentiYoutube di MongoDB.
+    Ogni documento ha: _id, utente_commento, data_ora, valore_sentiment, commento
+    
+    Args:
+        comments: Lista di commenti da salvare
+        
+    Returns:
+        True se salvati con successo, False altrimenti
+    """
+    try:
+        client = get_mongodb_client()
+        if client is None:
+            return False
+        
+        db = client[MONGODB_DATABASE]
+        collection = db[MONGODB_COLLECTION]
+        
+        documents = []
+        for c in comments:
+            # Usa comment_id come _id se disponibile, altrimenti genera uno nuovo
+            doc = {
+                "_id": c.get("comment_id", f"yt_{datetime.now().timestamp()}_{c.get('author', 'unknown')}"),
+                "utente_commento": c.get("author", "Unknown"),
+                "data_ora": c.get("published_at", datetime.now().isoformat()),
+                "valore_sentiment": None,  # Sarà un valore con la virgola (float), per ora vuoto
+                "commento": c.get("text", "")
+            }
+            documents.append(doc)
+        
+        if documents:
+            # Usa upsert per evitare duplicati
+            for doc in documents:
+                collection.update_one(
+                    {"_id": doc["_id"]},
+                    {"$set": doc},
+                    upsert=True
+                )
+            
+            print(f"[MongoDB] Salvati {len(documents)} commenti nella collezione {MONGODB_COLLECTION}")
+        
+        client.close()
+        return True
+        
+    except Exception as e:
+        print(f"[MongoDB] Errore salvataggio commenti: {e}")
+        return False
 
 
 # -----------------------------
@@ -278,6 +357,16 @@ class YouTubeCommentsStreaming:
                     
                     print(f"[YouTubeCommentsStreaming] Buffer aggiornato con {len(comments)} commenti")
                     
+                    # Salva i commenti in MongoDB
+                    save_comments_to_mongodb(comments)
+                    
+                    # Calcola automaticamente il sentiment per i commenti salvati
+                    if SENTIMENT_ENABLED:
+                        try:
+                            process_pending_comments()
+                        except Exception as sentiment_error:
+                            print(f"[YouTubeCommentsStreaming] Errore calcolo sentiment: {sentiment_error}")
+                    
                     # Processa con Spark se disponibile
                     if self._spark is not None:
                         self._process_with_spark(comments)
@@ -435,13 +524,33 @@ def stop_live_comments_streaming() -> None:
 
 def get_live_comments() -> List[Dict]:
     """
-    Ottiene gli ultimi 5 commenti live dal buffer.
+    Ottiene gli ultimi 5 commenti live dal buffer con i valori di sentiment.
     
     Returns:
-        Lista di commenti (max 5)
+        Lista di commenti (max 5) con valore_sentiment
     """
     global _comments_buffer
-    return _comments_buffer.get_comments()
+    comments = _comments_buffer.get_comments()
+    
+    # Recupera i valori di sentiment da MongoDB
+    try:
+        client = get_mongodb_client()
+        if client:
+            db = client[MONGODB_DATABASE]
+            collection = db[MONGODB_COLLECTION]
+            
+            for comment in comments:
+                comment_id = comment.get("comment_id")
+                if comment_id:
+                    doc = collection.find_one({"_id": comment_id})
+                    if doc:
+                        comment["valore_sentiment"] = doc.get("valore_sentiment")
+            
+            client.close()
+    except Exception as e:
+        print(f"[YoutubeComments5] Errore recupero sentiment: {e}")
+    
+    return comments
 
 
 def get_live_comment_at(index: int) -> Optional[Dict]:

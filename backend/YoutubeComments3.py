@@ -1,9 +1,21 @@
 """
 YoutubeComments3 - Ottiene multipli commenti puliti da un video YouTube
+Con salvataggio automatico in MongoDB e calcolo del sentiment.
 """
 from googleapiclient.discovery import build
+from pymongo import MongoClient
+from datetime import datetime
 import re
 import html
+import os
+
+# Import del modulo per il calcolo del sentiment
+try:
+    from YoutubeComments6 import process_pending_comments
+    SENTIMENT_ENABLED = True
+except ImportError:
+    print("[YoutubeComments3] Modulo YoutubeComments6 non disponibile, sentiment disabilitato")
+    SENTIMENT_ENABLED = False
 
 # -----------------------------
 # CONFIG
@@ -13,6 +25,11 @@ MAX_COMMENTS = 5
 MIN_CHARS = 80
 
 SPAM_KEYWORDS = ["subscribe"]
+
+# MongoDB Configuration
+MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
+MONGODB_DATABASE = "cinematch_db"
+MONGODB_COLLECTION = "CommentiVotati"
 
 
 # -----------------------------
@@ -73,6 +90,63 @@ def is_spam(text: str) -> bool:
 
 
 # -----------------------------
+# MONGODB
+# -----------------------------
+def get_mongodb_client():
+    """Ottiene il client MongoDB."""
+    try:
+        client = MongoClient(MONGODB_URL)
+        return client
+    except Exception as e:
+        print(f"[MongoDB] Errore connessione: {e}")
+        return None
+
+
+def save_comments_to_mongodb(comments: list) -> bool:
+    """
+    Salva i commenti nella collezione CommentiYoutube di MongoDB.
+    """
+    try:
+        client = get_mongodb_client()
+        if client is None:
+            return False
+        
+        db = client[MONGODB_DATABASE]
+        collection = db[MONGODB_COLLECTION]
+        
+        for c in comments:
+            # Genera un ID unico basato sul contenuto del commento per evitare duplicati
+            text = c.get("text", "")
+            author = c.get("author", "unknown")
+            # Usa hash del testo per ID univoco (evita duplicati)
+            text_hash = hash(text) & 0xffffffff  # Converte in positivo
+            comment_id = f"yt3_{author}_{text_hash}"
+            
+            doc = {
+                "_id": comment_id,
+                "utente_commento": author,
+                "data_ora": c.get("published_at", datetime.now().isoformat()),
+                "valore_sentiment": None,  # Sarà calcolato automaticamente
+                "commento": text
+            }
+            
+            # Usa upsert per evitare duplicati (basato su _id)
+            collection.update_one(
+                {"_id": doc["_id"]},
+                {"$set": doc},
+                upsert=True
+            )
+        
+        print(f"[MongoDB] Salvati {len(comments)} commenti dalla sezione 'Commenti Analizzati'")
+        client.close()
+        return True
+        
+    except Exception as e:
+        print(f"[MongoDB] Errore salvataggio commenti: {e}")
+        return False
+
+
+# -----------------------------
 # COMMENTI YOUTUBE
 # -----------------------------
 def get_multiple_comments(youtube_url: str, max_comments: int = 5, min_chars: int = 5) -> list:
@@ -129,6 +203,38 @@ def get_multiple_comments(youtube_url: str, max_comments: int = 5, min_chars: in
 
             request = youtube.commentThreads().list_next(request, response)
 
+        # Salva i commenti in MongoDB e calcola il sentiment
+        if collected:
+            save_comments_to_mongodb(collected)
+            
+            # Calcola automaticamente il sentiment
+            if SENTIMENT_ENABLED:
+                try:
+                    process_pending_comments()
+                except Exception as e:
+                    print(f"[YoutubeComments3] Errore calcolo sentiment: {e}")
+            
+            # Recupera i valori di sentiment da MongoDB e aggiungili ai commenti
+            try:
+                client = get_mongodb_client()
+                if client:
+                    db = client[MONGODB_DATABASE]
+                    collection = db[MONGODB_COLLECTION]
+                    
+                    for comment in collected:
+                        text = comment.get("text", "")
+                        author = comment.get("author", "unknown")
+                        text_hash = hash(text) & 0xffffffff
+                        comment_id = f"yt3_{author}_{text_hash}"
+                        
+                        doc = collection.find_one({"_id": comment_id})
+                        if doc:
+                            comment["valore_sentiment"] = doc.get("valore_sentiment")
+                    
+                    client.close()
+            except Exception as e:
+                print(f"[YoutubeComments3] Errore recupero sentiment: {e}")
+
         return collected
 
     except Exception as e:
@@ -145,3 +251,4 @@ def get_trailer_comments(trailer_url: str, max_comments: int = 5) -> list:
         return []
     
     return get_multiple_comments(trailer_url, max_comments=max_comments, min_chars=MIN_CHARS)
+

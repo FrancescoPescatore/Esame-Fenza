@@ -28,6 +28,7 @@ from YoutubeComments import get_upcoming_movie_with_trailer
 from YoutubeComments2 import get_latest_comment_for_trailer
 from YoutubeComments3 import get_trailer_comments
 from YoutubeComments5 import get_live_comments_for_trailer, get_live_comment_at, start_live_comments_streaming, stop_live_comments_streaming
+from YoutubeComments7 import get_sentiment_averages
 
 # ============================================
 # APP CONFIGURATION
@@ -746,6 +747,18 @@ async def get_live_trailer_comment_at_index(index: int):
                 "status": "not_found",
                 "message": f"Nessun commento all'indice {index}"
             }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
+@app.get("/sentiment-averages")
+async def get_sentiment_averages_endpoint():
+    """Ottiene le medie del sentiment per le collezioni CommentiLive e CommentiVotati."""
+    try:
+        result = get_sentiment_averages()
+        return result
     except Exception as e:
         return {
             "status": "error",
