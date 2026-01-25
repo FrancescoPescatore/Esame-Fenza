@@ -23,7 +23,7 @@ except ImportError:
 # -----------------------------
 YOUTUBE_API_KEY = "AIzaSyCWgR9xeE3H2arlD_M8twh82WJ8cc2g6WQ"
 MAX_COMMENTS = 5
-MIN_CHARS = 80
+MIN_CHARS = 30
 
 SPAM_KEYWORDS = ["subscribe"]
 
@@ -152,7 +152,7 @@ def save_comments_to_mongodb(comments: list) -> bool:
 # -----------------------------
 # COMMENTI YOUTUBE
 # -----------------------------
-def get_multiple_comments(youtube_url: str, max_comments: int = 5, min_chars: int = 5) -> list:
+def get_multiple_comments(youtube_url: str, max_comments: int = 5, min_chars: int = 30) -> list:
     """
     Ottiene multipli commenti validi da un video YouTube.
     Restituisce una lista di dizionari con author, published_at, text.
