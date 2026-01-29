@@ -1,23 +1,23 @@
-# file che gestisce gli ultimi 5 commenti live con spark structured Streaming
+# YoutubeComments5 - Orchestration layer for YouTube comments streaming
 """
-YoutubeComments5 - Gestisce gli ultimi 5 commenti live con Spark Structured Streaming
-Questo modulo implementa un sistema di streaming per raccogliere e processare
-commenti YouTube in tempo reale usando Apache Spark Structured Streaming.
+YoutubeComments5 - Layer di orchestrazione per Kafka + Spark Structured Streaming
+Questo layer gestisce il lifecycle dei processi di streaming.
+
+Architecture:
+- Ingestion: YoutubeProducer.py (Subprocess) → Kafka
+- Processing: YoutubeSparkConsumer.py (Subprocess) → MongoDB
+- Orchestration: This file (Spawns processes, reads from MongoDB)
 """
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import from_json, col, current_timestamp, window, desc
-from pyspark.sql.types import StructType, StructField, StringType, TimestampType
-from googleapiclient.discovery import build
 import re
 import html
-import json
-import threading
+import subprocess
+import sys
+import os
+import signal
 import time
 from typing import List, Dict, Optional
-from collections import deque
 from pymongo import MongoClient
 from datetime import datetime
-import os
 
 # Import del modulo per il calcolo del sentiment
 try:
@@ -31,11 +31,8 @@ except ImportError:
 # -----------------------------
 # CONFIG
 # -----------------------------
-YOUTUBE_API_KEY = "AIzaSyCWgR9xeE3H2arlD_M8twh82WJ8cc2g6WQ"
 MAX_COMMENTS = 5
 MIN_CHARS = 80
-POLLING_INTERVAL = 30  # Secondi tra ogni polling
-
 SPAM_KEYWORDS = ["subscribe"]
 
 # MongoDB Configuration
@@ -43,9 +40,15 @@ MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
 MONGODB_DATABASE = "cinematch_db"
 MONGODB_COLLECTION = "CommentiLive"
 
+# Process Management
+_producer_process: Optional[subprocess.Popen] = None
+_consumer_process: Optional[subprocess.Popen] = None
+_streaming_active = False
+_current_trailer_url: Optional[str] = None
+
 
 # -----------------------------
-# UTILITY
+# UTILITY FUNCTIONS
 # -----------------------------
 def extract_video_id(youtube_url: str) -> str:
     """Estrae il video ID da un URL YouTube."""
@@ -57,451 +60,43 @@ def extract_video_id(youtube_url: str) -> str:
 def clean_comment(text: str) -> str:
     """Pulisce il testo del commento."""
     text = html.unescape(text)
-
-    # rimuove HTML
     text = re.sub(r"<.*?>", "", text)
-
-    # rimuove URL
     text = re.sub(r"http\S+", "", text)
-
-    # rimuove timestamp tipo 1:23
     text = re.sub(r"\b\d{1,2}:\d{2}\b", "", text)
-
-    # rimuove emoji / caratteri strani (soft)
     text = re.sub(r"[^\w\s.,!?'\"]", "", text)
-
-    # spazi multipli
     text = re.sub(r"\s+", " ", text).strip()
-
     return text
 
 
 def is_spam(text: str) -> bool:
     """Controlla se il commento è spam."""
     lower = text.lower()
-
-    # keyword spam
     for k in SPAM_KEYWORDS:
-        if k in lower:
-            return True
-
-    # troppi link
-    if text.count("http") > 0:
-        return True
-
-    # tutto maiuscolo
-    if text.isupper():
-        return True
-
-    # troppe ripetizioni
+        if k in lower: return True
+    if text.count("http") > 0: return True
+    if text.isupper(): return True
     words = text.split()
-    if len(words) > 10 and len(set(words)) / len(words) < 0.4:
-        return True
-
+    if len(words) > 10 and len(set(words)) / len(words) < 0.4: return True
     return False
 
 
 # -----------------------------
-# MONGODB
+# MONGODB Helper
 # -----------------------------
 def get_mongodb_client():
-    """Ottiene il client MongoDB."""
     try:
-        client = MongoClient(MONGODB_URL)
-        return client
+        return MongoClient(MONGODB_URL)
     except Exception as e:
         print(f"[MongoDB] Errore connessione: {e}")
         return None
 
 
-def save_comments_to_mongodb(comments: List[Dict]) -> bool:
-    """
-    Salva i commenti nella collezione CommentiYoutube di MongoDB.
-    Ogni documento ha: _id, utente_commento, data_ora, valore_sentiment, commento
-    
-    Args:
-        comments: Lista di commenti da salvare
-        
-    Returns:
-        True se salvati con successo, False altrimenti
-    """
-    try:
-        client = get_mongodb_client()
-        if client is None:
-            return False
-        
-        db = client[MONGODB_DATABASE]
-        collection = db[MONGODB_COLLECTION]
-        
-        documents = []
-        for c in comments:
-            # Usa comment_id come _id se disponibile, altrimenti genera uno nuovo
-            doc = {
-                "_id": c.get("comment_id", f"yt_{datetime.now().timestamp()}_{c.get('author', 'unknown')}"),
-                "utente_commento": c.get("author", "Unknown"),
-                "data_ora": c.get("published_at", datetime.now().isoformat()),
-                "valore_sentiment": None,  # Sarà un valore con la virgola (float), per ora vuoto
-                "commento": c.get("text", "")
-            }
-            documents.append(doc)
-        
-        if documents:
-            # Usa upsert per evitare duplicati
-            for doc in documents:
-                collection.update_one(
-                    {"_id": doc["_id"]},
-                    {"$set": doc},
-                    upsert=True
-                )
-            
-            print(f"[MongoDB] Salvati {len(documents)} commenti nella collezione {MONGODB_COLLECTION}")
-        
-        client.close()
-        return True
-        
-    except Exception as e:
-        print(f"[MongoDB] Errore salvataggio commenti: {e}")
-        return False
-
-
 # -----------------------------
-# COMMENTS BUFFER (Thread-Safe)
-# -----------------------------
-class CommentsBuffer:
-    """
-    Buffer thread-safe per memorizzare gli ultimi 5 commenti.
-    Usa un deque con maxlen per mantenere solo gli ultimi N commenti.
-    """
-    
-    def __init__(self, max_size: int = 5):
-        self._buffer: deque = deque(maxlen=max_size)
-        self._lock = threading.RLock()
-        self._last_update = None
-    
-    def add_comment(self, comment: Dict) -> None:
-        """Aggiunge un commento al buffer (thread-safe)."""
-        with self._lock:
-            # Evita duplicati basandosi su author + text
-            existing_keys = {(c["author"], c["text"]) for c in self._buffer}
-            if (comment["author"], comment["text"]) not in existing_keys:
-                self._buffer.append(comment)
-                self._last_update = time.time()
-    
-    def add_comments(self, comments: List[Dict]) -> None:
-        """Aggiunge multipli commenti al buffer."""
-        for comment in comments:
-            self.add_comment(comment)
-    
-    def get_comments(self) -> List[Dict]:
-        """Restituisce tutti i commenti nel buffer (thread-safe)."""
-        with self._lock:
-            return list(self._buffer)
-    
-    def get_comment_at(self, index: int) -> Optional[Dict]:
-        """Restituisce il commento all'indice specificato."""
-        with self._lock:
-            if 0 <= index < len(self._buffer):
-                return self._buffer[index]
-            return None
-    
-    def count(self) -> int:
-        """Restituisce il numero di commenti nel buffer."""
-        with self._lock:
-            return len(self._buffer)
-    
-    def clear(self) -> None:
-        """Svuota il buffer."""
-        with self._lock:
-            self._buffer.clear()
-    
-    def get_last_update(self) -> Optional[float]:
-        """Restituisce il timestamp dell'ultimo aggiornamento."""
-        with self._lock:
-            return self._last_update
-
-
-# Buffer globale per i commenti live
-_comments_buffer = CommentsBuffer(max_size=MAX_COMMENTS)
-
-
-# -----------------------------
-# YOUTUBE COMMENT FETCHER
-# -----------------------------
-def fetch_latest_comments(youtube_url: str, max_comments: int = 5, min_chars: int = 80) -> List[Dict]:
-    """
-    Recupera gli ultimi commenti validi da un video YouTube.
-    Usato come sorgente per lo streaming.
-    """
-    video_id = extract_video_id(youtube_url)
-
-    try:
-        youtube = build(
-            "youtube",
-            "v3",
-            developerKey=YOUTUBE_API_KEY
-        )
-
-        collected = []
-
-        request = youtube.commentThreads().list(
-            part="snippet",
-            videoId=video_id,
-            maxResults=50,
-            textFormat="plainText",
-            order="time"  # Ordinati per tempo (più recenti prima)
-        )
-
-        while request and len(collected) < max_comments:
-            response = request.execute()
-
-            for item in response.get("items", []):
-                snippet = item["snippet"]["topLevelComment"]["snippet"]
-                raw = snippet["textDisplay"]
-                cleaned = clean_comment(raw)
-
-                if len(cleaned) < min_chars:
-                    continue
-
-                if is_spam(cleaned):
-                    continue
-
-                comment_data = {
-                    "author": snippet["authorDisplayName"],
-                    "published_at": snippet["publishedAt"],
-                    "text": cleaned,
-                    "comment_id": item["id"]
-                }
-
-                collected.append(comment_data)
-
-                if len(collected) >= max_comments:
-                    break
-
-            if len(collected) >= max_comments:
-                break
-
-            request = youtube.commentThreads().list_next(request, response)
-
-        return collected
-
-    except Exception as e:
-        print(f"Errore recupero commenti YouTube: {e}")
-        return []
-
-
-# -----------------------------
-# SPARK STRUCTURED STREAMING
-# -----------------------------
-class YouTubeCommentsStreaming:
-    """
-    Classe che gestisce lo streaming dei commenti YouTube usando
-    Spark Structured Streaming per il processing in tempo reale.
-    """
-    
-    def __init__(self, app_name: str = "YouTubeCommentsStreaming"):
-        self._spark: Optional[SparkSession] = None
-        self._streaming_query = None
-        self._is_running = False
-        self._polling_thread: Optional[threading.Thread] = None
-        self._current_trailer_url: Optional[str] = None
-        self._app_name = app_name
-        self._stop_event = threading.Event()
-    
-    def _init_spark(self) -> SparkSession:
-        """Inizializza la sessione Spark."""
-        if self._spark is None:
-            self._spark = SparkSession.builder \
-                .appName(self._app_name) \
-                .config("spark.sql.streaming.checkpointLocation", "/tmp/youtube_comments_checkpoint") \
-                .config("spark.driver.memory", "1g") \
-                .config("spark.executor.memory", "1g") \
-                .getOrCreate()
-            
-            # Imposta log level
-            self._spark.sparkContext.setLogLevel("WARN")
-        
-        return self._spark
-    
-    def _get_schema(self) -> StructType:
-        """Schema per i commenti YouTube."""
-        return StructType([
-            StructField("comment_id", StringType(), True),
-            StructField("author", StringType(), True),
-            StructField("published_at", StringType(), True),
-            StructField("text", StringType(), True),
-            StructField("processed_at", TimestampType(), True)
-        ])
-    
-    def _polling_worker(self, trailer_url: str) -> None:
-        """
-        Worker thread che effettua il polling periodico dei commenti YouTube
-        e li processa attraverso Spark Structured Streaming.
-        """
-        global _comments_buffer
-        
-        print(f"[YouTubeCommentsStreaming] Avvio polling per: {trailer_url}")
-        
-        while not self._stop_event.is_set():
-            try:
-                # Recupera gli ultimi commenti
-                comments = fetch_latest_comments(
-                    trailer_url, 
-                    max_comments=MAX_COMMENTS, 
-                    min_chars=MIN_CHARS
-                )
-                
-                if comments:
-                    # Aggiorna il buffer con i nuovi commenti
-                    _comments_buffer.clear()  # Svuota e riempi con i più recenti
-                    _comments_buffer.add_comments(comments)
-                    
-                    print(f"[YouTubeCommentsStreaming] Buffer aggiornato con {len(comments)} commenti")
-                    
-                    # Salva i commenti in MongoDB
-                    save_comments_to_mongodb(comments)
-                    
-                    # Calcola automaticamente il sentiment per i commenti salvati
-                    if SENTIMENT_ENABLED:
-                        try:
-                            process_pending_comments()
-                        except Exception as sentiment_error:
-                            print(f"[YouTubeCommentsStreaming] Errore calcolo sentiment: {sentiment_error}")
-                    
-                    # Processa con Spark se disponibile
-                    if self._spark is not None:
-                        self._process_with_spark(comments)
-                
-            except Exception as e:
-                print(f"[YouTubeCommentsStreaming] Errore polling: {e}")
-            
-            # Attendi prima del prossimo polling
-            self._stop_event.wait(POLLING_INTERVAL)
-        
-        print("[YouTubeCommentsStreaming] Polling terminato")
-    
-    def _process_with_spark(self, comments: List[Dict]) -> None:
-        """
-        Processa i commenti usando Spark DataFrame per analisi batch.
-        In un setup completo, questo si integrerebbe con un sistema di streaming
-        come Kafka per lo streaming vero e proprio.
-        """
-        try:
-            from pyspark.sql import Row
-            from datetime import datetime
-            
-            # Crea RDD e DataFrame dai commenti
-            rows = [
-                Row(
-                    comment_id=c.get("comment_id", ""),
-                    author=c["author"],
-                    published_at=c["published_at"],
-                    text=c["text"],
-                    processed_at=datetime.now()
-                )
-                for c in comments
-            ]
-            
-            if rows:
-                df = self._spark.createDataFrame(rows)
-                
-                # Esempio di elaborazione: ordinamento per tempo
-                df_sorted = df.orderBy(desc("published_at"))
-                
-                # Log del processamento
-                print(f"[Spark] Processati {df_sorted.count()} commenti")
-                
-        except Exception as e:
-            print(f"[Spark] Errore processing: {e}")
-    
-    def start_streaming(self, trailer_url: str) -> bool:
-        """
-        Avvia lo streaming dei commenti per un trailer specifico.
-        
-        Args:
-            trailer_url: URL del trailer YouTube da monitorare
-            
-        Returns:
-            True se lo streaming è stato avviato con successo
-        """
-        if self._is_running:
-            if self._current_trailer_url == trailer_url:
-                print("[YouTubeCommentsStreaming] Streaming già attivo per questo trailer")
-                return True
-            else:
-                self.stop_streaming()
-        
-        try:
-            # Inizializza Spark
-            self._init_spark()
-            
-            # Resetta lo stop event
-            self._stop_event.clear()
-            
-            # Avvia il thread di polling
-            self._current_trailer_url = trailer_url
-            self._polling_thread = threading.Thread(
-                target=self._polling_worker,
-                args=(trailer_url,),
-                daemon=True
-            )
-            self._polling_thread.start()
-            
-            self._is_running = True
-            print(f"[YouTubeCommentsStreaming] Streaming avviato per: {trailer_url}")
-            
-            return True
-            
-        except Exception as e:
-            print(f"[YouTubeCommentsStreaming] Errore avvio: {e}")
-            return False
-    
-    def stop_streaming(self) -> None:
-        """Ferma lo streaming corrente."""
-        if not self._is_running:
-            return
-        
-        self._stop_event.set()
-        
-        if self._polling_thread and self._polling_thread.is_alive():
-            self._polling_thread.join(timeout=5)
-        
-        self._is_running = False
-        self._current_trailer_url = None
-        print("[YouTubeCommentsStreaming] Streaming fermato")
-    
-    def is_running(self) -> bool:
-        """Verifica se lo streaming è attivo."""
-        return self._is_running
-    
-    def shutdown(self) -> None:
-        """Arresta completamente il sistema, inclusa la sessione Spark."""
-        self.stop_streaming()
-        
-        if self._spark is not None:
-            self._spark.stop()
-            self._spark = None
-        
-        print("[YouTubeCommentsStreaming] Sistema arrestato")
-
-
-# Istanza globale del streaming manager
-_streaming_manager: Optional[YouTubeCommentsStreaming] = None
-
-
-def get_streaming_manager() -> YouTubeCommentsStreaming:
-    """Ottiene l'istanza singleton del manager streaming."""
-    global _streaming_manager
-    if _streaming_manager is None:
-        _streaming_manager = YouTubeCommentsStreaming()
-    return _streaming_manager
-
-
-# -----------------------------
-# PUBLIC API
+# PROCESS ORCHESTRATION
 # -----------------------------
 def start_live_comments_streaming(trailer_url: str) -> bool:
     """
-    Avvia lo streaming dei commenti live per un trailer.
+    Avvia lo streaming spawnando i processi Producer e Consumer.
     
     Args:
         trailer_url: URL del trailer YouTube
@@ -509,142 +104,157 @@ def start_live_comments_streaming(trailer_url: str) -> bool:
     Returns:
         True se avviato con successo
     """
+    global _producer_process, _consumer_process, _streaming_active, _current_trailer_url
+    
     if not trailer_url:
         return False
+        
+    # Se già attivo per lo stesso URL, ignora
+    if _streaming_active and _current_trailer_url == trailer_url:
+        print(f"[YoutubeComments5] Streaming già attivo per {trailer_url}")
+        return True
+        
+    # Se attivo per altro URL, ferma prima
+    if _streaming_active:
+        stop_live_comments_streaming()
+        
+    print(f"[YoutubeComments5] Avvio streaming per: {trailer_url}")
     
-    manager = get_streaming_manager()
-    return manager.start_streaming(trailer_url)
+    try:
+        # Percorsi degli script
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        producer_script = os.path.join(base_dir, "YoutubeProducer.py")
+        consumer_script = os.path.join(base_dir, "YoutubeSparkConsumer.py")
+        
+        # Environment per i sottoprocessi (eredita corrente)
+        env = os.environ.copy()
+        
+        # -- 1. AVVIO PRODUCER --
+        # Passiamo il VIDEO ID tramite variabile ambiente o argomento?
+        # YoutubeProducer.py attualmente ha VIDEO_ID hardcoded nel main. 
+        # Modifica necessaria: YoutubeProducer dovrebbe accettare argomenti. 
+        # Per ora lo avviamo, ma nota che userà il video default se non modificato.
+        # TODO: Aggiornare YoutubeProducer.py per leggere env var TARGET_VIDEO_ID
+        env["TARGET_VIDEO_ID"] = extract_video_id(trailer_url)
+        
+        log_prod = open(os.path.join(base_dir, "producer.log"), "a")
+        _producer_process = subprocess.Popen(
+            [sys.executable, producer_script],
+            env=env,
+            stdout=log_prod,
+            stderr=subprocess.STDOUT
+        )
+        print(f"[YoutubeComments5] Producer avviato (PID: {_producer_process.pid})")
+        
+        # -- 2. AVVIO CONSUMER (Spark) --
+        log_cons = open(os.path.join(base_dir, "consumer.log"), "a")
+        _consumer_process = subprocess.Popen(
+            [sys.executable, consumer_script],
+            env=env,
+            stdout=log_cons,
+            stderr=subprocess.STDOUT
+        )
+        print(f"[YoutubeComments5] Consumer avviato (PID: {_consumer_process.pid})")
+        
+        _streaming_active = True
+        _current_trailer_url = trailer_url
+        
+        return True
+        
+    except Exception as e:
+        print(f"[YoutubeComments5] Errore avvio processi: {e}")
+        stop_live_comments_streaming()  # Cleanup
+        return False
 
 
 def stop_live_comments_streaming() -> None:
-    """Ferma lo streaming dei commenti live."""
-    manager = get_streaming_manager()
-    manager.stop_streaming()
+    """Ferma i processi di streaming."""
+    global _producer_process, _consumer_process, _streaming_active, _current_trailer_url
+    
+    print("[YoutubeComments5] Arresto streaming...")
+    
+    # helper kill
+    def kill_proc(proc):
+        if proc:
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            except Exception as e:
+                print(f"Errore kill processo: {e}")
+                
+    kill_proc(_producer_process)
+    kill_proc(_consumer_process)
+    
+    _producer_process = None
+    _consumer_process = None
+    _streaming_active = False
+    _current_trailer_url = None
+    print("[YoutubeComments5] Streaming fermato")
 
 
+def is_streaming_active() -> bool:
+    return _streaming_active
+
+
+# -----------------------------
+# PUBLIC API (Lettura)
+# -----------------------------
 def get_live_comments() -> List[Dict]:
-    """
-    Ottiene gli ultimi 5 commenti live dal buffer con i valori di sentiment.
-    
-    Returns:
-        Lista di commenti (max 5) con valore_sentiment
-    """
-    global _comments_buffer
-    comments = _comments_buffer.get_comments()
-    
-    # Recupera i valori di sentiment da MongoDB
     try:
         client = get_mongodb_client()
-        if client:
-            db = client[MONGODB_DATABASE]
-            collection = db[MONGODB_COLLECTION]
-            
-            for comment in comments:
-                comment_id = comment.get("comment_id")
-                if comment_id:
-                    doc = collection.find_one({"_id": comment_id})
-                    if doc:
-                        comment["valore_sentiment"] = doc.get("valore_sentiment")
-            
-            client.close()
+        if not client: return []
+        
+        db = client[MONGODB_DATABASE]
+        collection = db[MONGODB_COLLECTION]
+        
+        # Recupera ultimi commenti
+        cursor = collection.find().sort("data_ora", -1).limit(MAX_COMMENTS)
+        
+        comments = []
+        for doc in cursor:
+            comments.append({
+                "comment_id": doc.get("_id"),
+                "author": doc.get("utente_commento", "Unknown"),
+                "published_at": doc.get("data_ora", ""),
+                "text": doc.get("commento", ""),
+                "valore_sentiment": doc.get("valore_sentiment")
+            })
+        
+        client.close()
+        return comments
     except Exception as e:
-        print(f"[YoutubeComments5] Errore recupero sentiment: {e}")
-    
-    return comments
-
+        print(f"[YoutubeComments5] Errore get_live_comments: {e}")
+        return []
 
 def get_live_comment_at(index: int) -> Optional[Dict]:
-    """
-    Ottiene un commento specifico dal buffer live.
-    
-    Args:
-        index: Indice del commento (0-4)
-        
-    Returns:
-        Dizionario con il commento o None se non esiste
-    """
-    global _comments_buffer
-    return _comments_buffer.get_comment_at(index)
-
+    comments = get_live_comments()
+    return comments[index] if 0 <= index < len(comments) else None
 
 def get_live_comments_count() -> int:
-    """
-    Ottiene il numero di commenti attualmente nel buffer.
-    
-    Returns:
-        Numero di commenti
-    """
-    global _comments_buffer
-    return _comments_buffer.count()
-
+    return len(get_live_comments())
 
 def get_live_comments_for_trailer(trailer_url: str) -> Dict:
-    """
-    Wrapper principale per ottenere i commenti live da un trailer.
-    Avvia lo streaming se non già attivo e restituisce il buffer corrente.
-    
-    Args:
-        trailer_url: URL del trailer YouTube
-        
-    Returns:
-        Dizionario con status, comments, count, e streaming_active
-    """
+    """API entry point"""
     if not trailer_url:
-        return {
-            "status": "error",
-            "message": "URL trailer non valido",
-            "comments": [],
-            "count": 0,
-            "streaming_active": False
-        }
+        return {"status": "error", "message": "URL invalido", "comments": [], "active": False}
     
-    manager = get_streaming_manager()
+    # Auto-start streaming (Orchestration logic)
+    if not _streaming_active or _current_trailer_url != trailer_url:
+        start_live_comments_streaming(trailer_url)
     
-    # Avvia streaming se non attivo
-    if not manager.is_running():
-        # Prima chiamata: fetch sincrono immediato + avvia streaming
-        comments = fetch_latest_comments(trailer_url, max_comments=MAX_COMMENTS, min_chars=MIN_CHARS)
-        _comments_buffer.clear()
-        _comments_buffer.add_comments(comments)
-        
-        # Avvia streaming in background
-        manager.start_streaming(trailer_url)
-    
-    # Restituisci il buffer corrente
     comments = get_live_comments()
     
+    if SENTIMENT_ENABLED and comments:
+        try:
+            process_pending_comments()
+        except: pass
+        
     return {
         "status": "success",
         "comments": comments,
         "count": len(comments),
-        "streaming_active": manager.is_running()
+        "streaming_active": _streaming_active
     }
-
-
-# -----------------------------
-# TEST
-# -----------------------------
-if __name__ == "__main__":
-    # Test del modulo
-    TEST_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"  # Esempio
-    
-    print("=== Test YoutubeComments5 con Spark Structured Streaming ===")
-    
-    # Test fetch diretto
-    print("\n1. Test fetch commenti:")
-    comments = fetch_latest_comments(TEST_URL, max_comments=3, min_chars=10)
-    for i, c in enumerate(comments):
-        print(f"  {i+1}. {c['author']}: {c['text'][:50]}...")
-    
-    # Test streaming
-    print("\n2. Test streaming:")
-    result = get_live_comments_for_trailer(TEST_URL)
-    print(f"  Streaming attivo: {result['streaming_active']}")
-    print(f"  Commenti nel buffer: {result['count']}")
-    
-    # Attendi un po' per vedere il polling
-    time.sleep(5)
-    
-    # Stop streaming
-    stop_live_comments_streaming()
-    print("\n3. Streaming fermato")

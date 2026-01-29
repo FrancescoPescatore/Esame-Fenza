@@ -56,7 +56,67 @@ Nonostante la denormalizzazione, il sistema mantiene una capacità di query sofi
 Non tutto è incorporato. Per entità che crescono indefinitamente (Unbounded Arrays), manteniamo collezioni separate:
 *   **Commenti/Eventi Streaming**: I commenti di YouTube o gli eventi di tracking NON sono nel documento del film, poiché potrebbero essere migliaia. Sono gestiti nelle collezioni `CommentiLive` o `user_stats` e collegati via ID o logica applicativa.
 
-## 3.5 Riepilogo Vantaggi
+## 3.5 Ricerca Avanzata con Elasticsearch
+
+Per superare i limiti delle performance della ricerca testuale su MongoDB (che utilizza regex o indici testuali semplici), CineMatch integra **Elasticsearch** per gestire funzionalità di ricerca avanzata, full-text e tollerante agli errori ("fuzzy search").
+
+### 3.5.1 Sincronizzazione Dati (`sync_mongo_to_elasticsearch.py`)
+Il database MongoDB rimane la "Single Source of Truth", ma i dati vengono replicati su Elasticsearch per l'indicizzazione. Uno script dedicato (`backend/sync_mongo_to_elasticsearch.py`) si occupa di:
+1.  **Leggere dal Catalogo**: Itera su tutti i film in `movies_catalog`.
+2.  **Arricchimento Recensioni**: Per ogni film, recupera le recensioni associate dalla collezione `reviews` (join applicativa).
+3.  **Denormalizzazione**: Costruisce un "documento di ricerca" piatto che include metadati (titolo, attori, regista, generi) e il testo delle recensioni.
+4.  **Indicizzazione**: Invia il documento all'indice `movies` di Elasticsearch.
+
+Questo permette di cercare un film non solo per titolo, ma anche per parole chiave contenute nella trama o nelle opinioni degli utenti.
+
+### 3.5.2 Endpoint di Ricerca Ibrida (`/catalog/advanced-search`)
+L'endpoint nel backend (`main.py`) implementa una strategia ibrida per garantire velocità e coerenza dei dati:
+
+```python
+# Pseudo-codice della logica di ricerca
+def advanced_search(query, fields):
+    try:
+        # 1. Ricerca "Fuzzy" su Elasticsearch
+        hits = es.search(index="movies", body={
+            "query": {
+                "multi_match": {
+                    "query": query,
+                    "fields": fields,  # Es. ["title", "description", "actors"]
+                    "fuzziness": "AUTO"
+                }
+            }
+        })
+
+        # 2. Idratazione da MongoDB (Pattern "Hybrid Fetch")
+        # Elasticsearch restituisce i match, ma per garantire che i Poster URL
+        # siano sempre aggiornati (es. fix di link rotti), recuperiamo
+        # i metadati visivi freschi da MongoDB usando i titoli trovati.
+        titles = [hit["_source"]["title"] for hit in hits]
+        fresh_posters = db.movies_catalog.find({"title": {"$in": titles}})
+        
+        # 3. Merge dei risultati
+        return merge_results(hits, fresh_posters)
+
+    except ElasticsearchError:
+        # Fallback automatico su MongoDB se ES è giù
+        return mongo_regex_search(query)
+```
+
+**Vantaggi dell'approccio ibrido:**
+*   **Velocità**: ES calcola lo score di rilevanza (`_score`) molto meglio di Mongo.
+*   **Freschezza**: I dati volatili (come URL immagini o statistiche voti aggiornate in tempo reale) vengono presi da Mongo.
+*   **Resilienza**: Il sistema degrada graziosamente alla ricerca base se il motore di ricerca non risponde.
+
+### 3.5.3 ElasticSearch vs MongoDB Atlas Search
+
+Sebbene **MongoDB Atlas** offra una funzionalità nativa di "Atlas Search" (basata su Lucene) che renderebbe superfluo un motore esterno, il progetto CineMatch è progettato per funzionare in ambiente **On-Premise / Locale** utilizzando **MongoDB Community Edition**.
+
+La versione Community di MongoDB non supporta Atlas Search. Pertanto, l'integrazione di **Elasticsearch** è stata una scelta architetturale necessaria per abilitare funzionalità di:
+*   **Fuzzy Matching**: Gestione di typo e errori di battitura nei titoli.
+*   **Relevance Scoring**: Ordinamento dei risultati non solo per campi esatti ma per rilevanza semantica.
+*   **Full-Text Search Avanzata**: Analisi linguistica su trame e recensioni (stemming, stop-words) non supportata nativamente dalle regex di Mongo.
+
+## 3.6 Riepilogo Vantaggi
 
 | Caratteristica | Approccio Relazionale | Approccio CineMatch (Embedded) | Vantaggio |
 | :--- | :--- | :--- | :--- |
